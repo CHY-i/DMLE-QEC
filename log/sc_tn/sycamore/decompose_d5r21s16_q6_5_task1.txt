@@ -1,0 +1,18 @@
+TN Decoder LER with correlated error rates: 0.39180000000000303
+TN Decoder LER with rl_share_correlated_matching error rates: 0.3901200000000031
+TN Decoder LER with rl_share_belief_matching error rates: 0.39996000000000276
+TN Decoder LER with planarnet error rates: 0.3856533333333354
+TN Decoder LER with tn error rates: 0.3794400000000032
+BM Decoder LER with correlated error rates: 0.40036
+BM Decoder LER with rl_share_correlated_matching error rates: 0.4030533333333333
+BM Decoder LER with rl_share_belief_matching error rates: 0.3967733333333333
+BM Decoder LER with planarnet error rates: 0.39952
+BM Decoder LER with tn error rates: 0.39784
+CM Decoder LER with correlated error rates (read): 0.40036 
+CM Decoder LER with rl_share_correlated_matching error rates (read): 0.4030533333333333 
+CM Decoder LER with rl_share_belief_matching error rates (read): 0.3967733333333333 
+CM Decoder LER with correlated error rates (recal): 0.4111066666666666 
+CM Decoder LER with rl_share_correlated_matching error rates (recal): 0.41322666666666663 
+CM Decoder LER with rl_share_belief_matching error rates (recal): 0.4140533333333334 
+CM Decoder LER with planarnet error rates: 0.41235999999999995
+CM Decoder LER with tn error rates: 0.4159866666666666
