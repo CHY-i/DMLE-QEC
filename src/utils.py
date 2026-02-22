@@ -26,18 +26,16 @@ def build_dual_matrix(pcm, l , seperate_dual_l=False):
     compact_pcm_l = np.concatenate([compact_var.reshape(1, -1), pcm_l], axis=0)
     # print(compact_pcm_l)
     rows, num_edges = compact_pcm_l.shape
-    # ==========================================
-    # 1. 构建原图 G_primal (用于找面)
-    # ==========================================
+
     G_primal = nx.Graph()
     G_primal.add_nodes_from(range(int(rows)))
     
-    # 辅助字典：通过节点对查找边索引
+
     node_pair_to_edge_idx = {}
     
     for c in range(num_edges):
         connected_nodes = np.where(compact_pcm_l[:, c] == 1)[0]
-        # 强制转换为 int 避免 numpy 报错
+
         if len(connected_nodes) == 2:
             u, v = int(connected_nodes[0]), int(connected_nodes[1])
             G_primal.add_edge(u, v, id=c)
@@ -46,13 +44,9 @@ def build_dual_matrix(pcm, l , seperate_dual_l=False):
             node_pair_to_edge_idx[key] = c
             
         elif len(connected_nodes) == 1:
-            # 原图中的悬挂边，虽然不能构成面，但需要记录
-            # 在某些定义下它不参与面对偶，但为了完整性，我们先保留索引逻辑
+
             pass
 
-    # ==========================================
-    # 2. 寻找面 (多边形)
-    # ==========================================
     cycles_nodes = nx.minimum_cycle_basis(G_primal)
     
     # Filter to only keep simple cycles (cycles where all consecutive nodes are directly connected)
@@ -219,11 +213,11 @@ def build_dual_matrix(pcm, l , seperate_dual_l=False):
     simple_cycles = cycle_list
     num_faces = len(simple_cycles)
 
-    # 映射：边索引 -> [属于哪些面 ID]
+
     edge_to_faces = {i: [] for i in range(num_edges)}
     
     for face_id, cycle in enumerate(simple_cycles):
-        # 遍历圈的边
+
         for k in range(len(cycle)):
             u = cycle[k]
             v = cycle[(k + 1) % len(cycle)]
@@ -233,15 +227,12 @@ def build_dual_matrix(pcm, l , seperate_dual_l=False):
                 e_idx = node_pair_to_edge_idx[key]
                 edge_to_faces[e_idx].append(face_id)
 
-    # ==========================================
-    # 3. 构建对偶矩阵 (面 x 边)
-    # ==========================================
     dual_matrix = np.zeros((num_faces, num_edges), dtype=int)
     for e_idx, faces in edge_to_faces.items():
         for f_id in faces:
             dual_matrix[f_id, e_idx] = 1
     dual_l = dual_matrix.sum(0)%2
-    dual_l[:len(dual_l)//2] = 0  # 前半部分对应原图的边，不计入对偶逻辑
+    dual_l[:len(dual_l)//2] = 0  
     if seperate_dual_l:
         return dual_matrix, dual_l
     else:
@@ -440,9 +431,7 @@ class rep_cir():
                         self.pebz[i, np.where(self.hx[[didx-j,didx-j-1]].sum(0)==2)[0]] = 1
         
         assert (self.hx @ self.pebz.T % 2 - np.eye(self.m, self.m)).all() == 0
-        # print(self.hx.astype(np.int32))
-        # print(self.pebz.astype(np.int32))
-        # print(self.hx @ self.pebz.T % 2)
+ 
 
     def reorder(self, dem, rotated_graph=True):
         d=self.d-1
@@ -484,17 +473,13 @@ class rep_cir():
                         idx = int(D[1:])
                         edge1.append(-1)
                 edge1.sort()
-                # order.append(E.index(edge1))
+      
                 E1.append(edge1)
-        # print(dorder)
-        # print(self.E)
+ 
         eorder = []
         for i in range(self.n):
             index = self.E.index(E1[i])
             eorder.append(index)
-            # for j in range(len(self.E[index])):
-            #     if self.E[index][j] >= 0 :
-            #         self.E[index][j] = dorder[self.E[index][j]]
 
         
         if rotated_graph == False:
@@ -687,13 +672,12 @@ def update_dem(dem, ers):
     new_dem = stim.DetectorErrorModel()
     for i, instruction in enumerate(dem):
     # print(instruction.type)
-        if instruction.type == "error":  # 直接检查指令名称
+        if instruction.type == "error":  
             args = instruction.args_copy()
             targets = instruction.targets_copy()
-            new_p = ers[i]  # 修改概率
-            
+            new_p = ers[i]  
             new_dem.append(stim.DemInstruction(
-                "error",  # 直接使用指令名称字符串
+                "error",  
                 args=[new_p],
                 targets=targets
             ))
@@ -880,10 +864,9 @@ def generate_compactified_pcm_from_seperated_dem(dem: stim.DetectorErrorModel):
         if instruction.type != "error":
             continue
 
-        prob = instruction.args_copy()[0] # 获取该错误指令的概率
+        prob = instruction.args_copy()[0] 
         all_targets = instruction.targets_copy()
-        
-        # --- 1. 拆分所有被分隔符 (^) 分开的部分 ---
+
         all_parts = []
         current_part = []
         for t in all_targets:
@@ -899,10 +882,7 @@ def generate_compactified_pcm_from_seperated_dem(dem: stim.DetectorErrorModel):
         if not all_parts:
             continue
 
-        # --- 2. 提取逻辑 ---
-        # 按照需求：如果第一部分是超边且没有分解建议，则忽略
-        # 如果有分解建议或本身是 graphlike，则把所有符合条件的“部分”都当做独立的边
-        
+ 
         is_graphlike = (len(all_parts[0]) <= 2)
         has_decomposition = (len(all_parts) > 1)
 
@@ -910,10 +890,7 @@ def generate_compactified_pcm_from_seperated_dem(dem: stim.DetectorErrorModel):
             # 这是一个没有分解建议的超边，根据 PyMatching 规则忽略
             ignored_hyperedges_indices.append(i)
             continue
-        # print(i, all_parts)
-        # 将所有满足 degree <= 2 的部分加入待处理列表
-        # 注意：如果是超边分解，第一部分（超边本身）会被跳过，只加后面分解出的边
-        # 如果第一部分本身就是 graphlike，它也会被加入
+
         for part in all_parts:
             if len(part) <= 2 and len(part) > 0:
                 pair = tuple(sorted(part))
@@ -1239,15 +1216,4 @@ def _einsum_int(ixs: list[list[int]], iy: list[int], tensors: list[torch.Tensor]
     
 
 if __name__ == "__main__":
-    from src.subrep import normalize_google_dem_coords
-    try:
-        base_path = "/data/fengdongyang/workspace/PlanarNet/dataset/sycamore_surface_code_d3_d5/sample_00/d5_at_q6_5/X"
-        dem_google = normalize_google_dem_coords(stim.DetectorErrorModel.from_file(f"{base_path}/r05/dems/correlations.dem"))
-        dem_google_r9 = normalize_google_dem_coords(stim.DetectorErrorModel.from_file(f"{base_path}/r09/dems/correlations.dem"))
-        
-        print("\n--- Testing Chunk=4 ---")
-        broadcast_dem(dem_google, 11, 4, dem_google_r9)
-        print("\n--- Testing Chunk=2 ---")
-        broadcast_dem(dem_google, 11, 2, dem_google_r9)
-    except Exception as e:
-        print(f"Test failed: {e}")
+    None

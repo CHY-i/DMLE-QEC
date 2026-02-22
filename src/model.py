@@ -323,10 +323,7 @@ class TensorNetwork(nn.Module):
         pass
 
     def generate_xor_tensors(self):
-        """
-        生成 Check Node Tensors。
-        策略：利用 Hadamard 分解 (Hyper Tensor)，并将归一化常数融合进张量值中。
-        """
+ 
         degree_xor = self.pcm.sum(axis=1)
         self.xor_list = []
         
@@ -531,9 +528,7 @@ class TensorNetwork(nn.Module):
         return path
 
     def save_path(self, path, filename="best_contraction_path.pkl"):
-        """
-        将缩并路径序列化并保存到文件。
-        """
+
         import pickle  
 
         try:
@@ -545,9 +540,7 @@ class TensorNetwork(nn.Module):
 
     # --- 新增：加载路径 ---
     def load_path(self, filename="best_contraction_path.pkl"):
-        """
-        从文件加载缩并路径。
-        """
+
         import pickle
         import os
         if not os.path.exists(filename):
@@ -564,9 +557,7 @@ class TensorNetwork(nn.Module):
 
     def load_tree(self, filename):
         import json
-        """
-        从文件加载缩并路径。
-        """
+
         import os
         if not os.path.exists(filename):
             raise FileNotFoundError(f"Tree file '{filename}' not found.")

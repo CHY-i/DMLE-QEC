@@ -170,7 +170,7 @@ class MWPM_dem:
         return logical_flip
     
     def logical_error_rate(self, syndrome, logical_ideal, error_rates=None, weights=None):
-        # print(logical_ideal.type)
+
         if isinstance(logical_ideal, np.ndarray):
             logical_ideal = logical_ideal.squeeze().astype(bool)
         elif isinstance(logical_ideal, list):
@@ -194,22 +194,18 @@ class MWPM_dem:
 
 class MWPM_graph:
     def __init__(self, dem, enable_correlations=False):
-        # 初始化 Matching 对象
+
         self.enable_correlations = enable_correlations
         self.matcher = Matching.from_detector_error_model(dem, enable_correlations=enable_correlations)
     
     def set_edges_weights(self, error_rates=None, weights=None):
-        """
-        直接修改 Matching 图中边的权重，无需重建。
-        """
-        # --- 1. 数据预处理 (保持你的逻辑) ---
+
         if weights is None and error_rates is not None:
             if isinstance(error_rates, torch.Tensor):
                 error_rates = error_rates.detach().cpu().numpy()
             elif isinstance(error_rates, list):
                 error_rates = np.array(error_rates)
             
-            # 避免 log(0)
             epsilon = 1e-15
             error_rates = np.clip(error_rates, epsilon, 1 - epsilon)
             weights = np.log((1 - error_rates) / error_rates)
@@ -219,17 +215,14 @@ class MWPM_graph:
                 weights = weights.detach().cpu().numpy()
             elif isinstance(weights, list):
                 weights = np.array(weights)
-            # 反推 error_rates (可选，PyMatching 主要用 weight)
+        
             error_rates = 1 / (1 + np.exp(weights))
         else:
             raise ValueError('Must input error rates or weights !!!')
 
-        # --- 2. 关键：获取现有边，覆盖更新 ---
-        # 注意：这里假设输入的 weights 数组长度和顺序与 matcher.edges() 完全一致
+   
         current_edges = self.matcher.edges()
         
-        if len(weights) != len(current_edges):
-            print(f"警告: 权重数量 ({len(weights)}) 与边数量 ({len(current_edges)}) 不匹配！")
         
         for i, (u, v, attr) in enumerate(current_edges):
             if i >= len(weights):
@@ -239,9 +232,9 @@ class MWPM_graph:
             new_prob = error_rates[i]
             existing_fault_ids = attr.get('fault_ids', set())
             
-            # --- 关键修改开始 ---
+         
             if v is None:
-                # 这是一个边界边 (Boundary Edge)
+
                 self.matcher.add_boundary_edge(
                     u,
                     fault_ids=existing_fault_ids,
@@ -250,7 +243,7 @@ class MWPM_graph:
                     merge_strategy="replace"
                 )
             else:
-                # 这是一个普通边 (Internal Edge)
+                
                 self.matcher.add_edge(
                     u, 
                     v, 
@@ -302,20 +295,14 @@ class MWPM_graph:
 
 class BeliefMatching_dem:
     def __init__(self, dem, max_iter=10):
-        """
-        Args:
-            dem: Stim 的 DetectorErrorModel
-            max_iter: BP 迭代的最大次数
-            bp_method: BP 算法类型 ('min_sum' 或 'product_sum')
-            enable_correlations: 虽然 Belief Matching 内部处理逻辑不同，但保留接口一致性
-        """
+
         self.dem = dem
         self.max_iter = max_iter
         self.decoder = BeliefMatching(dem, max_bp_iters=max_iter)
 
         
     def decode(self, syndrome, error_rates=None, weights=None):
-        # 1. 预处理 syndrome 格式
+
         if isinstance(syndrome, torch.Tensor):
             syndrome = syndrome.detach().cpu().numpy().astype(np.uint8).squeeze()
         elif isinstance(syndrome, np.ndarray):
@@ -326,16 +313,14 @@ class BeliefMatching_dem:
         if syndrome.ndim == 1:
             syndrome = syndrome[np.newaxis, :]
 
-        # 2. 获取更新后的 DEM 或错误概率
-        # 注意：BeliefFind 需要从 DEM 提取检查矩阵 (H) 和 错误概率 (p)
-        
+
         if weights is None and error_rates is not None:
             if isinstance(error_rates, torch.Tensor):
                 error_rates = error_rates.detach().cpu().numpy()
             dem = update_dem(dem=self.dem, ers=error_rates)
         elif weights is not None and error_rates is None:
             if isinstance(weights, torch.Tensor):
-                # 转换 log-odds (weights) 回 概率 (error_rates)
+             
                 error_rates = torch.sigmoid(-weights.detach()).cpu().numpy()
             dem = update_dem(dem=self.dem, ers=error_rates)
         else:
