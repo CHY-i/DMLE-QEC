@@ -6,7 +6,7 @@ This repository provides a framework for Differentiable Maximum Likelihood Estim
 
 ## 1.Initialization
 
-<pre>
+```python
 import stim
 from src import rep_cir, PlanarNet, get_error_rates
 
@@ -36,12 +36,12 @@ dataset = TensorDataset(dets)
 pertub = torch.rand_like(er)
 init_er = (er + (2*torch.bernoulli(torch.ones(len(er)).to(torch.float64)/2)-1.)*er*pertub) 
 
-</pre>
+```
 
 ## 2.Optimization
 
-<pre>
 
+```python
 def optimizing(init_er, rep, dataset, dev='cuda:0', 
                            epochs=100, batch_size=100000, mini_batch=10000, lr=0.001):
     
@@ -101,5 +101,4 @@ optimized_error_rates = optimizing(
     epochs=100
 )
 
-</pre>
-
+```
