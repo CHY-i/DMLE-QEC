@@ -1,0 +1,14 @@
+beliefmatching==0.2.0
+cotengra==0.7.5
+fire==0.7.1
+kahypar==1.3.6
+ldpc==2.4.1
+numpy==2.2.6
+opt_einsum==3.4.0
+PyMatching==2.3.1
+scipy==1.17.0
+stim==1.15.0
+torch==2.9.1+cu130
+torchvision==0.24.1+cu130
+tqec==0.1.0
+
