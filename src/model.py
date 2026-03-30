@@ -510,8 +510,7 @@ class TensorNetwork(nn.Module):
             parallel=20
         )
 
-        # --- 获取路径 ---
-        # 注意：这里把 optimize 参数设为 opt 对象
+
         path, path_info = oe.contract_path(self.eq_str, *shapes, optimize=opt, shapes=True)
         
         import math
@@ -522,8 +521,12 @@ class TensorNetwork(nn.Module):
         max_tensor_gb = (path_info.largest_intermediate * 8) / (1024**3)
         print(f"3. Peak Memory:            {max_tensor_gb:.2f} GB")
         
-        # Cotengra 还可以可视化路径树（如果安装了 graphviz）
-        # opt.get_tree().plot_ring() 
+        # ================= 新增的判断逻辑 =================
+        if space_complexity >= 30:
+            print(f"❌ 警告: 找到的路径 Space Complexity ({space_complexity:.2f}) 达到或超过 30！")
+            print("这会导致极高的显存占用，拒绝采用该路径。")
+            return None
+        # ==================================================
         
         return path
 
