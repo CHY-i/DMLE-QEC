@@ -40,7 +40,7 @@ def get_or_create_contraction_path(tn, path_file, minibatch=50, max_time=120):
 
 
 # 3_5 5_3 5_7 7_5
-def train_sycamore_old(basis='X', r='03', center='3_5', epochs=100, lr=0.01, batch_size=10000, minibatch=100, nprint=10, dev='cuda:3'):
+def train_sycamore_old(basis='X', r='03', center='5_3', epochs=150, lr=0.01, batch_size=10000, minibatch=100, nprint=10, dev='cuda:3'):
     """
     极简版 TN 训练函数 (附带 LER 验证与日志记录)
     :param basis: 'X' 或 'Z'
@@ -117,7 +117,7 @@ def train_sycamore_old(basis='X', r='03', center='3_5', epochs=100, lr=0.01, bat
     # ler_bm = bm.logical_error_rate(dets_np, obvs, er_sim)
     
     with torch.no_grad():
-        if int(r) < 19:
+        if int(r) < 11:
             ler_tn = decoder.logical_error_rate(
                 torch.from_numpy(dets_np).to(dev).to(torch.float64), 
                 torch.from_numpy(obvs).to(dev).to(torch.float64), 
@@ -198,7 +198,7 @@ def train_sycamore_old(basis='X', r='03', center='3_5', epochs=100, lr=0.01, bat
             
             # 💡 修复 1：加上 torch.no_grad()，这是防止验证期爆显存的关键！
             with torch.no_grad():
-                if int(r) < 19:
+                if int(r) < 11:
                     ler_tn = decoder.logical_error_rate(
                         torch.from_numpy(dets_np).to(dev).to(torch.float64), 
                         torch.from_numpy(obvs).to(dev).to(torch.float64), 
@@ -226,7 +226,7 @@ def train_sycamore_old(basis='X', r='03', center='3_5', epochs=100, lr=0.01, bat
                         
                     ler_tn = total_errors / total_shots
                     
-            log_msg = f'epoch : {epoch} loss : {avg_loss:.8f} \n' #logical error rate (tn):{ler_tn:.8f} \n' 
+            log_msg = f'epoch : {epoch} loss : {avg_loss:.8f} logical error rate (tn):{ler_tn:.8f} \n' 
             log_file.write(log_msg)
             log_file.flush()
         # ====================================================
@@ -254,8 +254,18 @@ def train_sycamore_old(basis='X', r='03', center='3_5', epochs=100, lr=0.01, bat
     torch.save(er_list, final_save_path)
     print(f"训练完成！结果已保存至: {final_save_path}\n")
 
+def main(r='05', dev='cuda:0', minibatch=10000):
+    for basis in ['X', 'Z']:
+        for center in ['3_5', '5_3', '5_7', '7_5']:
+            log_dir  = f'log/sc_tn/sycamore_old/d3/r{r}_basis_{basis}_c{center}' 
+            if os.path.exists(log_dir):
+                None
+            else:
+                train_sycamore_old(basis=basis, r=r, center=center, minibatch=minibatch, dev=dev)
+
 if __name__ == "__main__":
     import fire
     fire.Fire({
         'training': train_sycamore_old,
+        'main': main
                })
