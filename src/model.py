@@ -507,7 +507,7 @@ class TensorNetwork(nn.Module):
             max_repeats=128,    # 尝试多少次搜索
             minimize='size',    # 优化目标
             progbar=True,        # 显示进度条
-            parallel=40,
+            parallel=120,
         )
 
 
