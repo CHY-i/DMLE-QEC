@@ -504,10 +504,10 @@ class TensorNetwork(nn.Module):
         # 对于显存不足的情况，建议优先尝试 'flops'，如果爆显存则改为 'size'
         opt = ctg.HyperOptimizer(
             max_time=max_time, 
-            max_repeats=64,    # 尝试多少次搜索
+            max_repeats=128,    # 尝试多少次搜索
             minimize='size',    # 优化目标
             progbar=True,        # 显示进度条
-            parallel=20
+            parallel=40,
         )
 
 

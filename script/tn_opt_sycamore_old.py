@@ -1,4 +1,5 @@
 import os
+import gc
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
@@ -13,7 +14,7 @@ from src import (TensorNetwork,
 def get_or_create_contraction_path(tn, path_file, minibatch=50, max_time=120):
     """
     检查指定的 contraction path 文件是否存在。
-    如果不存在，则调用 tn 的方法寻找路径，满足复杂度限制才保存。
+    如果不存在，则调用 tn 的方法寻找路径，满足复杂度限制才保存并释放内存。
     """
     if not os.path.exists(path_file):
         print(f"  --> Path file '{path_file}' 不存在. 开始使用 cotengra 寻找最佳收缩路径...")
@@ -22,10 +23,16 @@ def get_or_create_contraction_path(tn, path_file, minibatch=50, max_time=120):
         # 寻找路径
         path = tn.find_contraction_path(batch_size=minibatch, max_time=max_time)
         
-        # 判断返回的 path 是否有效 (即 space complexity 是否 < 30)
+        # 判断返回的 path 是否有效
         if path is not None:
             tn.save_path(path, filename=path_file)
             print(f"  --> 成功找到并保存健康的收缩路径！")
+            
+            # ================= 核心修改 =================
+            del path        # 1. 显式解除对巨型 path 对象的引用
+            gc.collect()    # 2. 强制 Python 立即进行全面的垃圾回收
+            # ============================================
+            
         else:
             # 如果找不到符合要求的路径，直接抛出异常中断程序
             raise RuntimeError(
@@ -38,6 +45,31 @@ def get_or_create_contraction_path(tn, path_file, minibatch=50, max_time=120):
     else:
         print(f"  --> Path file '{path_file}' 已存在，将直接加载。")
 
+
+def generate_path(basis='X', r='03', center='5_3', minibatch=100, max_time=60, dev='cpu'):
+    print(f"========== 独立寻路模式 | Basis: {basis}, r: {r}, Center: {center} ==========")
+    
+    # 1. 找到对应的 DEM 数据目录
+    data_dir = f'data/sycamore_old/surface_code_b{basis}_d3_r{r}_center_{center}'
+    dem_path = f'{data_dir}/circuit_detector_error_model.dem'
+    
+    if not os.path.exists(dem_path):
+        raise FileNotFoundError(f"DEM 文件不存在，请检查路径: {dem_path}")
+
+    # 2. 读取 DEM 并提取拓扑结构
+    dem = stim.DetectorErrorModel.from_file(dem_path)
+    er_sim = get_error_rates(dem)
+    pcm, l = PCM(dem)
+    
+    # 3. 初始化 TensorNetwork (仅用于寻路)
+    init_er = torch.from_numpy(er_sim).to(torch.float64)
+    priors_logits = torch.logit(init_er)
+    tn = TensorNetwork(pcm=pcm, priors_logits=priors_logits, dtype=torch.float64, dev=dev)
+    
+    # 4. 寻路并保存
+    path_file = f"path/sycamore_old/d3_r{r}_{basis}.pkl"
+    get_or_create_contraction_path(tn, path_file, minibatch=minibatch, max_time=max_time)
+    print("========== 寻路完成 ==========")
 
 # 3_5 5_3 5_7 7_5
 def train_sycamore_old(basis='X', r='03', center='5_3', epochs=150, lr=0.01, batch_size=10000, minibatch=100, nprint=10, dev='cuda:3'):
@@ -257,7 +289,7 @@ def train_sycamore_old(basis='X', r='03', center='5_3', epochs=150, lr=0.01, bat
 def main(r='05', dev='cuda:0', minibatch=10000):
     for basis in ['X', 'Z']:
         for center in ['3_5', '5_3', '5_7', '7_5']:
-            log_dir  = f'log/sc_tn/sycamore_old/d3/r{r}_basis_{basis}_c{center}' 
+            log_dir  = f'log/sc_tn/sycamore_old/d3/r{r}_basis_{basis}_c{center}/training_log.txt' 
             if os.path.exists(log_dir):
                 None
             else:
@@ -267,5 +299,6 @@ if __name__ == "__main__":
     import fire
     fire.Fire({
         'training': train_sycamore_old,
-        'main': main
-               })
+        'main': main,
+        'path': generate_path  # 新增：绑定命令行 'path' 命令
+    })
