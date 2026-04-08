@@ -11,7 +11,7 @@ from src import (TensorNetwork,
                  BeliefMatching_dem,
                  TensorNetworkDecoder)
 
-def get_or_create_contraction_path(tn, path_file, minibatch=50, max_time=120):
+def get_or_create_contraction_path(tn, path_file, minibatch=50, max_time=30):
     """
     检查指定的 contraction path 文件是否存在。
     如果不存在，则调用 tn 的方法寻找路径，满足复杂度限制才保存并释放内存。
@@ -46,12 +46,12 @@ def get_or_create_contraction_path(tn, path_file, minibatch=50, max_time=120):
         print(f"  --> Path file '{path_file}' 已存在，将直接加载。")
 
 
-def generate_path(basis='X', r='03', center='5_3', minibatch=100, max_time=60, dev='cpu'):
+def generate_path(basis='X', r='03', center='5_3', minibatch=100, max_time=30, dev='cpu'):
     print(f"========== 独立寻路模式 | Basis: {basis}, r: {r}, Center: {center} ==========")
     
     # 1. 找到对应的 DEM 数据目录
     data_dir = f'data/sycamore_old/surface_code_b{basis}_d3_r{r}_center_{center}'
-    dem_path = f'{data_dir}/circuit_detector_error_model.dem'
+    dem_path = f'{data_dir}/pij_from_even_for_odd.dem'
     
     if not os.path.exists(dem_path):
         raise FileNotFoundError(f"DEM 文件不存在，请检查路径: {dem_path}")
@@ -67,12 +67,12 @@ def generate_path(basis='X', r='03', center='5_3', minibatch=100, max_time=60, d
     tn = TensorNetwork(pcm=pcm, priors_logits=priors_logits, dtype=torch.float64, dev=dev)
     
     # 4. 寻路并保存
-    path_file = f"path/sycamore_old/d3_r{r}_{basis}.pkl"
+    path_file = f"path/sycamore_old_from_correlation/d3_r{r}_{basis}_{center}.pkl"
     get_or_create_contraction_path(tn, path_file, minibatch=minibatch, max_time=max_time)
     print("========== 寻路完成 ==========")
 
 # 3_5 5_3 5_7 7_5
-def train_sycamore_old(basis='X', r='03', center='5_3', epochs=500, lr=0.01, batch_size=50000, minibatch=100, nprint=10, dev='cuda:3'):
+def train_sycamore_old(basis='X', r='03', center='5_3', epochs=200, lr=0.01, batch_size=50000, minibatch=100, nprint=10, dev='cuda:3'):
     """
     极简版 TN 训练函数 (附带 LER 验证与日志记录)
     :param basis: 'X' 或 'Z'
@@ -82,8 +82,8 @@ def train_sycamore_old(basis='X', r='03', center='5_3', epochs=500, lr=0.01, bat
     
     # 1. 相对路径设置
     data_dir = f'data/sycamore_old/surface_code_b{basis}_d3_r{r}_center_{center}'
-    ckpt_dir = f'data/checks_old/d3/r{r}_basis_{basis}_c{center}'
-    log_dir  = f'log/sc_tn/sycamore_old/d3/r{r}_basis_{basis}_c{center}'
+    # ckpt_dir = f'data/checks_old/d3/r{r}_basis_{basis}_c{center}'
+    log_dir  = f'log/sc_tn/sycamore_old_from_correlation/d3/r{r}_basis_{basis}_c{center}'
     # os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
 
@@ -92,7 +92,7 @@ def train_sycamore_old(basis='X', r='03', center='5_3', epochs=500, lr=0.01, bat
     log_file = open(log_path, 'a')
 
     # 2. 读取 DEM 并获取 detector 数量
-    dem = stim.DetectorErrorModel.from_file(f'{data_dir}/circuit_detector_error_model.dem')#pij_from_even_for_odd
+    dem = stim.DetectorErrorModel.from_file(f'{data_dir}/pij_from_even_for_odd.dem')#
     num_detectors = dem.num_detectors
     er_sim = get_error_rates(dem)
     
@@ -136,7 +136,7 @@ def train_sycamore_old(basis='X', r='03', center='5_3', epochs=500, lr=0.01, bat
     tn = TensorNetwork(pcm=pcm, priors_logits=priors_logits, dtype=torch.float64, dev=dev)
     tn_decoding = TensorNetwork(pcm=pcm, l=l.flatten(), dtype=torch.float64, dev=dev, decoding=True)
     
-    path_file = f"path/sycamore_old/d3_r{r}_{basis}.pkl"
+    path_file = f"path/sycamore_old_from_correlation/d3_r{r}_{basis}_{center}.pkl"
     get_or_create_contraction_path(tn, path_file, minibatch=minibatch, max_time=120)
     tn.load_path(path_file)
     tn_decoding.load_path(path_file)
@@ -149,7 +149,7 @@ def train_sycamore_old(basis='X', r='03', center='5_3', epochs=500, lr=0.01, bat
     # ler_bm = bm.logical_error_rate(dets_np, obvs, er_sim)
     
     with torch.no_grad():
-        if int(r) < 11:
+        if int(r) < 9:
             ler_tn = decoder.logical_error_rate(
                 torch.from_numpy(dets_np).to(dev).to(torch.float64), 
                 torch.from_numpy(obvs).to(dev).to(torch.float64), 
@@ -230,7 +230,7 @@ def train_sycamore_old(basis='X', r='03', center='5_3', epochs=500, lr=0.01, bat
             
             # 💡 修复 1：加上 torch.no_grad()，这是防止验证期爆显存的关键！
             with torch.no_grad():
-                if int(r) < 11:
+                if int(r) < 9:
                     ler_tn = decoder.logical_error_rate(
                         torch.from_numpy(dets_np).to(dev).to(torch.float64), 
                         torch.from_numpy(obvs).to(dev).to(torch.float64), 
@@ -280,25 +280,31 @@ def train_sycamore_old(basis='X', r='03', center='5_3', epochs=500, lr=0.01, bat
     log_file.close()
 
     # 8. 训练结束，保存最终结果
-    save_dir = 'data/sycamore_old/processed_results'
+    save_dir = 'data/sycamore_old/processed_results_correlation'
     os.makedirs(save_dir, exist_ok=True)
     final_save_path = f'{save_dir}/d3_r{r}_b{basis}_c{center}.pt'
     torch.save(er_list, final_save_path)
     print(f"训练完成！结果已保存至: {final_save_path}\n")
 
-def main(r='05', dev='cuda:0', minibatch=10000):
+def main(r='05', dev='cuda:0', minibatch=10000, epochs=200):
     for basis in ['X', 'Z']:#'X', 
         for center in ['3_5', '5_3', '5_7', '7_5']:#, 
-            log_dir  = f'log/sc_tn/sycamore_old/d3/r{r}_basis_{basis}_c{center}/training_log.txt' 
+            log_dir  = f'log/sc_tn/sycamore_old_from_correlation/d3/r{r}_basis_{basis}_c{center}/training_log.txt' 
             if os.path.exists(log_dir):
                 None
             else:
-                train_sycamore_old(basis=basis, r=r, center=center, minibatch=minibatch, dev=dev)
+                train_sycamore_old(epochs=epochs, basis=basis, r=r, center=center, minibatch=minibatch, dev=dev)
+
+def path(r='05', minibatch=10000):
+    for basis in ['X', 'Z']:#'X', 
+        for center in ['3_5', '5_3', '5_7', '7_5']:#, 
+            path_dir  = f'log/sc_tn/sycamore_old_from_correlation/d3/r{r}_basis_{basis}_c{center}/training_log.txt' 
+            generate_path(basis=basis, r=r, center=center, minibatch=minibatch, max_time=60, dev='cpu')
 
 if __name__ == "__main__":
     import fire
     fire.Fire({
         'training': train_sycamore_old,
         'main': main,
-        'path': generate_path  # 新增：绑定命令行 'path' 命令
+        'path': path  # 新增：绑定命令行 'path' 命令
     })
