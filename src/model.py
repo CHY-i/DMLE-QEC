@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,266 +10,116 @@ from .utils import construct_kac_ward_solution, torch_rep_cir_log_coset_p, rep_c
 
 
 class PlanarNet(nn.Module):
-    def __init__(self, abstract_code=None, init_priors=None, dev='cpu', rep_configs=None,
-                 param_mode='logit', log_scale=1.0):
-        """
-        Initialize PlanarNet with either a single abstract_code or multiple rep_configs.
-        
-        Args:
-            abstract_code: Single rep_dem object (for backward compatibility)
-            init_priors: Initial error rate priors tensor (size matches original DEM)
-            dev: Device ('cpu' or 'cuda')
-            rep_configs: Dictionary mapping config_idx to rep_dem objects (for multiple configs)
-            param_mode: Parameterization mode
-                - 'logit': Use logit = log(p/(1-p)) with sigmoid (default, backward compatible)
-                - 'log_prior': Use log(p) with exp (better for small probabilities)
-            log_scale: Scaling factor for log_prior mode (default 1.0)
-                - When log_prior is used, parameter = log(p) / log_scale
-                - This helps optimize parameters in a more reasonable range
-                - Typical values: 0.1 to 1.0 (smaller = more scaling)
-        """
+    """Planar repetition-code NLL; optional external DEM priors (e.g. from GateNoiseToDEM)."""
+
+    def __init__(
+        self,
+        abstract_code,
+        init_priors,
+        *,
+        dev: str = "cpu",
+        param_mode: str = "logit",
+        log_scale: float = 1.0,
+        learn_priors: bool = True,
+    ) -> None:
         super().__init__()
+        if abstract_code is None or init_priors is None:
+            raise ValueError("abstract_code and init_priors are required")
+
         self.dev = dev
         self.param_mode = param_mode
         self.log_scale = log_scale
-        
-        # Support both single abstract_code (backward compatibility) and multiple rep_configs
-        if rep_configs is not None:
-            # Multiple configs mode: store rep_configs and cache for each
-            self.rep_configs = rep_configs
-            self.dtype = init_priors.dtype
-            
-            # Initialize parameter based on param_mode
-            if param_mode == 'logit':
-                init_param = torch.log(init_priors/(1.-init_priors))
-            elif param_mode == 'log_prior':
-                init_priors_clamped = torch.clamp(init_priors, 1e-10, 1.0 - 1e-10)
-                init_param = torch.log(init_priors_clamped) / log_scale
-            else:
-                raise ValueError(f"Unknown param_mode: {param_mode}. Must be 'logit' or 'log_prior'")
-            self.para = nn.Parameter(init_param.detach().to(self.dtype).to(self.dev))
-            
-            # Cache for each rep_dem (will be computed on first use in surface_subsample_forward_test)
-            self.rep_cache = {}
+        self.learn_priors = learn_priors
+        self.dtype = init_priors.dtype
+        self.num_priors = int(init_priors.numel())
+
+        self.generators = np.concatenate([abstract_code.hz, abstract_code.lz.reshape(1, -1)], axis=0)
+        self.kwz, self.edges_dict_z = construct_kac_ward_solution(self.generators)
+        self.pebz = torch.from_numpy(abstract_code.pebz).to(self.dtype).to(self.dev)
+        self.lz = torch.from_numpy(abstract_code.lz).to(self.dtype).to(self.dev)
+
+        init_priors = init_priors.detach().to(self.dtype).to(self.dev)
+        if param_mode == "logit":
+            init_param = torch.log(init_priors / (1.0 - init_priors))
+        elif param_mode == "log_prior":
+            init_priors_clamped = torch.clamp(init_priors, 1e-10, 1.0 - 1e-10)
+            init_param = torch.log(init_priors_clamped) / log_scale
         else:
-            # Single abstract_code mode (backward compatibility)
-            if abstract_code is None or init_priors is None:
-                raise ValueError("Either abstract_code and init_priors, or rep_configs must be provided")
-            
-            self.dtype = init_priors.dtype
-            self.init_priors = init_priors
-            
-            self.generators = np.concatenate([abstract_code.hz, abstract_code.lz.reshape(1, -1)], axis=0)
-            self.kwz, self.edges_dict_z = construct_kac_ward_solution(self.generators)
+            raise ValueError(f"Unknown param_mode: {param_mode}. Must be 'logit' or 'log_prior'")
 
-            # Initialize parameter based on param_mode
-            if param_mode == 'logit':
-                init_param = torch.log(init_priors/(1.-init_priors))
-            elif param_mode == 'log_prior':
-                init_priors_clamped = torch.clamp(init_priors, 1e-10, 1.0 - 1e-10)
-                init_param = torch.log(init_priors_clamped) / log_scale
-            else:
-                raise ValueError(f"Unknown param_mode: {param_mode}. Must be 'logit' or 'log_prior'")
-            self.para = nn.Parameter(init_param.detach().to(self.dtype).to(self.dev))
+        if learn_priors:
+            self.para = nn.Parameter(init_param.clone())
+        else:
+            self.register_buffer("para", init_param.clone())
 
-            self.pebz = torch.from_numpy(abstract_code.pebz).to(self.dtype).to(self.dev)
-            self.lz = torch.from_numpy(abstract_code.lz).to(self.dtype).to(self.dev)
-  
-        pass
-    
-    def get_priors(self):
-        """
-        Convert parameters to probabilities based on param_mode.
-        Returns probabilities clamped to [1e-20, 1-1e-20] for numerical stability.
-        """
-        if self.param_mode == 'logit':
-            # Original: sigmoid(logit)
+    def get_priors(self) -> torch.Tensor:
+        """Learnable DEM error probabilities (only when learn_priors=True)."""
+        if not self.learn_priors:
+            raise RuntimeError("learn_priors=False: use forward(..., priors=external_dem)")
+        if self.param_mode == "logit":
             priors = torch.sigmoid(self.para) + 1e-20
-        elif self.param_mode == 'log_prior':
-            # New: exp(log_prior * log_scale)
-            # Since para = log(p) / log_scale, we have: p = exp(para * log_scale)
+        elif self.param_mode == "log_prior":
             priors = torch.exp(self.para * self.log_scale) + 1e-20
-            # Clamp to ensure probabilities are in [0, 1]
             priors = torch.clamp(priors, 1e-20, 1.0 - 1e-20)
         else:
             raise ValueError(f"Unknown param_mode: {self.param_mode}")
         return priors
-    
-    # def logp_check(self, operator, error_rates):
-    #             return torch_rep_cir_log_coset_p(operator, self.kwz0, self.edges_dict_z0, error_rates=error_rates)
-    
-    def logp(self, operator, error_rates):
+
+    def _resolve_priors(self, priors: torch.Tensor | None) -> torch.Tensor:
+        if priors is None:
+            return self.get_priors()
+        if priors.ndim != 1:
+            raise ValueError(f"priors must be 1-D, got shape {tuple(priors.shape)}")
+        if priors.numel() != self.num_priors:
+            raise ValueError(
+                f"priors length {priors.numel()} != num_priors {self.num_priors} "
+                "(must match rep_cir.reorder'd DEM / g2dem.num_dem)"
+            )
+        return priors.to(device=self.pebz.device, dtype=self.dtype).clamp(1e-20, 1.0 - 1e-20)
+
+    def logp(self, operator: torch.Tensor, error_rates: torch.Tensor) -> torch.Tensor:
         return torch_rep_cir_log_coset_p(operator, self.kwz, self.edges_dict_z, error_rates=error_rates)
-    
-    def forward(self, det):
-        priors = self.get_priors()
+
+    def forward(self, det: torch.Tensor, priors: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Negative log-likelihood of detection events.
+
+        When learn_priors=False, pass differentiable DEM from g2dem: planar(det, priors=g2d()).
+        """
+        error_rates = self._resolve_priors(priors)
         with torch.no_grad():
-            x = det*1.
-            operator = x @ self.pebz % 2
-        logp = self.logp(operator, priors)
-        loss = - logp.mean()
-        return loss
-    
-    def subsample_forward(self, det, subsamples, sub_list):
+            operator = (det * 1.0) @ self.pebz % 2
+        logp = self.logp(operator, error_rates)
+        return -logp.mean()
 
-        loss = 0
-        for sub_idx in sub_list:
-            sub = subsamples[sub_idx]
-            det_sub = det[:, sub['det']]
-            
-            priors = self.get_priors() 
-
-            priors_sub = priors[sub['em']]
-            for e in sub['merge_e']:
-                new_value = (1 - priors_sub[e[0]]) * priors[e[2]] + priors_sub[e[0]] * (1 - priors[e[2]])
-                priors_sub = torch.cat([
-                    priors_sub[:e[0]],
-                    new_value.unsqueeze(0),
-                    priors_sub[e[0]+1:]
-                ])
-
-            with torch.no_grad():
-                x = det_sub
-                operator = x @ self.pebz % 2
-
-            logp = self.logp(operator, priors_sub)
-            loss = loss + - logp.mean()
-        
-        loss = loss/len(sub_list)
-        return loss
-    
-    def surface_subsample_forward(self, det, subsamples, sub_list, sub_idx_to_rep_mapping):
-        """
-        Forward pass for surface code subsampling.
-        Processes all configurations simultaneously, using rep_dem objects from sub_idx_to_rep_mapping.
-        
-        Args:
-            det: Detector data tensor
-            subsamples: List of subsample mappings
-            sub_list: List of subsample indices to process (all configurations are processed)
-            sub_idx_to_rep_mapping: Dict mapping sub_idx to rep_dem objects.
-                                   Must map each sub_idx to a rep_dem instance.
-        """
-        from .utils import construct_kac_ward_solution
-        
-        if sub_idx_to_rep_mapping is None or len(sub_idx_to_rep_mapping) == 0:
-            raise ValueError("sub_idx_to_rep_mapping must be provided and non-empty")
-        
-        loss = 0
-        
-        # Cache for computed pebz, kwz, edges_dict_z for each rep_dem object
-        # Use id(rep) as key to cache based on object identity
-        rep_cache = {}
-        
-        for sub_idx in sub_list:
-            sub = subsamples[sub_idx]  # Mapping from mapping_nomerge
-            
-            # Select relevant detectors for this subsample pattern
-            det_sub = det[:, sub['det']]
-            
-            # Get original priors (parameters)
-            # priors = self.para
-            priors = self.get_priors()
-            
-            # Construct subsampled priors vector using merge_e mapping
-            # merge_e format: (merged_idx, [original_idx1, original_idx2, ...])
-            # We need to build a tensor where the k-th element is the merged probability 
-            # for the k-th error in the subsample DEM (odd error probability)
-            merged_probs_list = []
-            
-            # Iterate through merge_e in order (sorted by merged_idx)
-            for merged_idx, orig_indices in sub['merge_e']:
-                # Extract probabilities for this group
-                # print(merged_idx, orig_indices)
-                group_probs = priors[orig_indices]
-                
-                if len(group_probs) == 0:
-                    merged_p = torch.tensor(0.0, dtype=self.dtype, device=self.dev)
-                elif len(group_probs) == 1:
-                    merged_p = group_probs[0]
-                else:
-                    # Calculate odd error probability: p_odd = 0.5 * (1 - prod(1 - 2*p))
-                    # Let q = 1 - 2p. Then q_new = q1 * q2 * ... * qn
-                    # p_odd = (1 - q_new) / 2
-                    q = 1.0 - 2.0 * group_probs
-                    q_prod = torch.prod(q)
-                    merged_p = 0.5 * (1.0 - q_prod)
-                
-                merged_probs_list.append(merged_p)
-                # Print merged probabilities as a pure python error rate list for inspection
-            # merged_probs_numpy = [p.item() for p in merged_probs_list]
-            # print(f"Merged error rates{sub_idx}:", merged_probs_numpy)
-            if not merged_probs_list:
-                # Handle case with no errors (should not happen in valid subsamples)
-                continue
-            
-            priors_sub = torch.stack(merged_probs_list)
-            
-            # Get rep_dem object for this sub_idx
-            rep_obj = sub_idx_to_rep_mapping.get(sub_idx)
-            if rep_obj is None:
-                raise ValueError(f"No rep_dem object found for sub_idx {sub_idx} in sub_idx_to_rep_mapping")
-            
-            # Get or compute cached values for this rep_dem object
-            rep_id = id(rep_obj)
-            if rep_id not in rep_cache:
-                # Compute and cache pebz, kwz, edges_dict_z for this rep_dem
-                generators = np.concatenate([rep_obj.hz, rep_obj.lz.reshape(1, -1)], axis=0)
-                kwz, edges_dict_z = construct_kac_ward_solution(generators)
-                pebz_tensor = torch.from_numpy(rep_obj.pebz).to(self.dtype).to(self.dev)
-                rep_cache[rep_id] = {
-                    'pebz': pebz_tensor,
-                    'kwz': kwz,
-                    'edges_dict_z': edges_dict_z
-                }
-            cached = rep_cache[rep_id]
-            pebz = cached['pebz']
-            kwz = cached['kwz']
-            edges_dict_z = cached['edges_dict_z']
-            
-            # Calculate loss using the merged priors
-            with torch.no_grad():
-                x = det_sub
-                operator = x @ pebz % 2
-            
-            # Use the appropriate logp calculation
-            logp = torch_rep_cir_log_coset_p(operator, kwz, edges_dict_z, error_rates=priors_sub)
-            loss = loss + - logp.mean()
-        
-        if len(sub_list) > 0:
-            loss = loss / len(sub_list)
-        
-        return loss
-
-
-    def cal_eloss(self, p_exact, x_exact):
-        priors = self.get_priors()
+    def cal_eloss(self, p_exact: torch.Tensor, x_exact: torch.Tensor, priors: torch.Tensor | None = None):
+        error_rates = self._resolve_priors(priors)
         with torch.no_grad():
             operator = x_exact @ self.pebz % 2
-        logp = self.logp(operator, priors)
-        loss = - (p_exact*logp).sum()
-        return loss
-    
+        logp = self.logp(operator, error_rates)
+        return -(p_exact * logp).sum()
+
     def test(self, p_exact, x_exact, nprint=None):
+        if not self.learn_priors:
+            raise RuntimeError("test() requires learn_priors=True")
         optim = torch.optim.AdamW([self.para], lr=0.01)
         er_his = []
         loss_his = []
-        # mean_re_his = []
         epochs = 500
-        for epoch in range(1, 1+epochs):
-            # print(self.para)
+        for epoch in range(1, 1 + epochs):
             loss = self.cal_eloss(p_exact, x_exact)
             optim.zero_grad()
             loss.backward()
             optim.step()
-            # if epoch <= 100 and epoch%5 == 0:
-            #     er_his.append(torch.sigmoid(self.para.detach().cpu()))
-            if nprint!=None and epoch%nprint == 0:
-                print('epoch:{}, nll:{}, grad_mean:{}'.format(epoch, loss.item(), self.para.grad.mean().item()))
+            if nprint is not None and epoch % nprint == 0:
+                print(
+                    f"epoch:{epoch}, nll:{loss.item()}, grad_mean:{self.para.grad.mean().item()}"
+                )
                 loss_his.append(loss.detach().cpu().item())
                 with torch.no_grad():
                     er_his.append(self.get_priors().detach().cpu())
         return er_his
+
 
 
 def xor_tensor(degree, dtype):
