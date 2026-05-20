@@ -93,7 +93,7 @@ def plot_d3r3_comparison(
         color="#d62728",
         label="DEM MRE (time_shared)",
     )
-
+    ax.set_yscale('log')
     ax.set_xlabel("epoch")
     ax.set_ylabel("MRE (mean_rel vs true)")
     ax.set_title("rep d3r3 — gate / DEM error vs training epoch")

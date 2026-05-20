@@ -7,6 +7,46 @@ from .utils import torch_rep_cir_log_coset_p, construct_kac_ward_solution, updat
 from .model import TensorNetwork
 
 
+def _syndrome_to_numpy_batch(syndrome, dtype):
+    """
+    Return syndrome with shape (n_shots, n_detectors) for batch decoders.
+
+    Avoid ``squeeze()`` on the last axis: ``(n, 1)`` must not become ``(n,)``,
+    otherwise a follow-up ``reshape(1, -1)`` wrongly treats shots as detectors.
+    """
+    if isinstance(syndrome, torch.Tensor):
+        s = syndrome.detach().cpu().numpy()
+    elif isinstance(syndrome, list):
+        s = np.asarray(syndrome)
+    else:
+        s = np.asarray(syndrome)
+    s = np.asarray(s, dtype=dtype, order="C")
+    if s.ndim == 0:
+        return s.reshape(1, 1)
+    if s.ndim == 1:
+        return s.reshape(1, -1)
+    if s.ndim == 2:
+        return s
+    raise ValueError(f"syndrome must be 0/1/2-D, got shape {tuple(s.shape)}")
+
+
+def _align_logical_bits(pred, ideal):
+    """Compare logical bits element-wise; flatten (n,1) vs (n,) pitfalls."""
+    p = np.asarray(pred, dtype=bool).reshape(-1)
+    t = np.asarray(ideal, dtype=bool).reshape(-1)
+    if p.shape != t.shape:
+        raise ValueError(f"logical pred shape {p.shape} != ideal {t.shape}")
+    return p, t
+
+
+def _predictions_as_decode_batch(pred):
+    """Normalize to (n_shots, n_obs) like PyMatching ``decode_batch``."""
+    p = np.asarray(pred, dtype=bool)
+    if p.ndim == 1:
+        return p[:, np.newaxis]
+    return p
+
+
 class Planar:
     def __init__(self, abstract_code, dev='cpu') -> None:
         '''pcm : hx,
@@ -27,12 +67,7 @@ class Planar:
         
 
     def decode(self, syndrome, error_rates):
-        if isinstance(syndrome, torch.Tensor):
-            syndrome = syndrome.detach().cpu().numpy().astype(bool).squeeze()
-        elif isinstance(syndrome, list):
-            syndrome = np.array(syndrome).astype(bool).squeeze()
-        elif isinstance(syndrome, np.ndarray):
-            syndrome = syndrome.astype(bool).squeeze()
+        syndrome = _syndrome_to_numpy_batch(syndrome, bool)
 
         if isinstance(error_rates, torch.Tensor):
             error_rates = error_rates.to(torch.float64).to(self.dev)
@@ -49,7 +84,10 @@ class Planar:
                                         ], dim=1)
                     
         idx_z = torch.argmax(log_coest_probs_z, dim=1)
-        logical_flip = ((pez @ torch.from_numpy(self.lx).to(torch.float64).to(self.dev)) % 2 + idx_z) % 2
+        lx = torch.from_numpy(np.asarray(self.lx, dtype=np.float64).reshape(-1)).to(
+            device=self.dev, dtype=torch.float64
+        )
+        logical_flip = ((pez @ lx) % 2 + idx_z) % 2
 
         return logical_flip.to(torch.bool)
 
@@ -62,10 +100,10 @@ class Planar:
         elif isinstance(logical_ideal, list):
             logical_ideal = torch.tensor(logical_ideal, device=self.dev).to(torch.bool).squeeze()
 
-        ns = syndrome.shape[0]
         logical_flip = self.decode(syndrome, error_rates)
-        # print(logical_flip.size(), logical_ideal.size())
-        return 1-torch.eq(logical_flip, logical_ideal).sum()/ns
+        logical_flip = logical_flip.reshape(-1)
+        logical_ideal = logical_ideal.reshape(-1)
+        return 1 - torch.eq(logical_flip, logical_ideal).float().mean()
 
 class MWPM:
     def __init__(self, abstract_code)-> None:
@@ -79,12 +117,7 @@ class MWPM:
         # self.pebz = abstract_code.pebz
         
     def decode(self, syndrome, error_rates=None, weights=None):
-        if isinstance(syndrome, torch.Tensor):
-            syndrome = syndrome.detach().cpu().numpy().astype(bool).squeeze()
-        elif isinstance(syndrome, np.ndarray):
-            syndrome = syndrome.astype(bool).squeeze()
-        elif isinstance(syndrome, list):
-            syndrome = np.array(syndrome).astype(bool).squeeze()
+        syndrome = _syndrome_to_numpy_batch(syndrome, bool)
 
         if weights is None and error_rates is not None:
             if isinstance(error_rates, torch.Tensor):
@@ -96,14 +129,14 @@ class MWPM:
         elif weights is not None and error_rates is None:
             if isinstance(weights, torch.Tensor):
                 weights = weights.detach().cpu().numpy()
-            elif isinstance(error_rates, list):
+            elif isinstance(weights, list):
                 weights = np.array(weights)
         else:
             print('Must input error rates or weights !!!')
 
         decoder = Matching(self.hx, weights=weights)
         recover = decoder.decode_batch(syndrome)
-        logical_flip = ((self.lx@recover.T)%2).squeeze()
+        logical_flip = ((self.lx @ recover.T) % 2).squeeze()
         return logical_flip
     
     def logical_error_rate(self, syndrome, logical_ideal, error_rates=None, weights=None):
@@ -115,16 +148,16 @@ class MWPM:
         elif isinstance(logical_ideal, torch.Tensor):
             logical_ideal = logical_ideal.detach().cpu().numpy().squeeze().astype(bool)
 
-        ns = syndrome.shape[0]
+        ns = _syndrome_to_numpy_batch(syndrome, bool).shape[0]
         if weights is None and error_rates is not None:
-            logical_flip = self.decode(syndrome=syndrome, error_rates=error_rates).squeeze().astype(bool)
+            logical_flip = self.decode(syndrome=syndrome, error_rates=error_rates).astype(bool)
         elif weights is not None and error_rates is None:
-            logical_flip = self.decode(syndrome=syndrome, weights=weights).squeeze().astype(bool)
+            logical_flip = self.decode(syndrome=syndrome, weights=weights).astype(bool)
         else:
             print('Must input error rates or weights !!!')
 
-        # print(logical_flip, logical_ideal)
-        ler = 1-np.equal(logical_flip, logical_ideal).sum()/ns
+        logical_flip, logical_ideal = _align_logical_bits(logical_flip, logical_ideal)
+        ler = 1 - np.equal(logical_flip, logical_ideal).mean()
         return ler
 
 class MWPM_dem:
@@ -134,17 +167,7 @@ class MWPM_dem:
         self.enable_correlations = enable_correlations
         
     def decode(self, syndrome, error_rates=None, weights=None, enable_correlations=None):
-
-
-        if isinstance(syndrome, torch.Tensor):
-            syndrome = syndrome.detach().cpu().numpy().astype(bool).squeeze()
-        elif isinstance(syndrome, np.ndarray):
-            syndrome = syndrome.astype(bool).squeeze()
-        elif isinstance(syndrome, list):
-            syndrome = np.array(syndrome).astype(bool).squeeze()
-        
-        if syndrome.ndim == 1:
-            syndrome = syndrome[np.newaxis, :]
+        syndrome = _syndrome_to_numpy_batch(syndrome, bool)
 
         if weights is None and error_rates is not None:
             if isinstance(error_rates, torch.Tensor):
@@ -166,7 +189,9 @@ class MWPM_dem:
         
         matcher = Matching.from_detector_error_model(new_dem, enable_correlations=use_correlations)
 
-        logical_flip = matcher.decode_batch(syndrome, enable_correlations=use_correlations).squeeze()
+        logical_flip = _predictions_as_decode_batch(
+            matcher.decode_batch(syndrome, enable_correlations=use_correlations)
+        )
         return logical_flip
     
     def logical_error_rate(self, syndrome, logical_ideal, error_rates=None, weights=None):
@@ -178,8 +203,6 @@ class MWPM_dem:
         elif isinstance(logical_ideal, torch.Tensor):
             logical_ideal = logical_ideal.detach().cpu().numpy().squeeze().astype(bool)
 
-        ns = syndrome.shape[0] if syndrome.ndim > 1 else 1
-        
         if weights is None and error_rates is not None:
             logical_flip = self.decode(syndrome=syndrome, error_rates=error_rates)
         elif weights is not None and error_rates is None:
@@ -187,8 +210,8 @@ class MWPM_dem:
         else:
             logical_flip = self.decode(syndrome=syndrome)
 
-        # print(logical_flip, logical_ideal)
-        ler = 1-np.equal(logical_flip, logical_ideal).sum()/ns
+        logical_flip, logical_ideal = _align_logical_bits(logical_flip, logical_ideal)
+        ler = 1 - np.equal(logical_flip, logical_ideal).mean()
         return ler
 
 
@@ -255,13 +278,7 @@ class MWPM_graph:
 
         
     def decode(self, syndrome, error_rates=None, weights=None):
-
-        if isinstance(syndrome, torch.Tensor):
-            syndrome = syndrome.detach().cpu().numpy().astype(bool).squeeze()
-        elif isinstance(syndrome, np.ndarray):
-            syndrome = syndrome.astype(bool).squeeze()
-        elif isinstance(syndrome, list):
-            syndrome = np.array(syndrome).astype(bool).squeeze()
+        syndrome = _syndrome_to_numpy_batch(syndrome, bool)
 
         if weights is None and error_rates is not None:
             self.set_edges_weights(error_rates=error_rates)
@@ -270,7 +287,9 @@ class MWPM_graph:
         else:
             None
             
-        logical_flip = self.matcher.decode_batch(syndrome, enable_correlations=self.enable_correlations).squeeze()
+        logical_flip = _predictions_as_decode_batch(
+            self.matcher.decode_batch(syndrome, enable_correlations=self.enable_correlations)
+        )
         return logical_flip
     
     def logical_error_rate(self, syndrome, logical_ideal, error_rates=None, weights=None):
@@ -282,14 +301,15 @@ class MWPM_graph:
         elif isinstance(logical_ideal, torch.Tensor):
             logical_ideal = logical_ideal.detach().cpu().numpy().squeeze().astype(bool)
 
-        ns = syndrome.shape[0]
+        ns = _syndrome_to_numpy_batch(syndrome, bool).shape[0]
         if weights is None and error_rates is not None:
-            logical_flip = self.decode(syndrome=syndrome, error_rates=error_rates).squeeze().astype(bool)
+            logical_flip = self.decode(syndrome=syndrome, error_rates=error_rates).astype(bool)
         elif weights is not None and error_rates is None:
-            logical_flip = self.decode(syndrome=syndrome, weights=weights).squeeze().astype(bool)
+            logical_flip = self.decode(syndrome=syndrome, weights=weights).astype(bool)
         else:
-            logical_flip = self.decode(syndrome=syndrome).squeeze().astype(bool)
-        ler = 1-np.equal(logical_flip, logical_ideal).sum()/ns
+            logical_flip = self.decode(syndrome=syndrome).astype(bool)
+        logical_flip, logical_ideal = _align_logical_bits(logical_flip, logical_ideal)
+        ler = 1 - np.equal(logical_flip, logical_ideal).mean()
         return ler
 
 
@@ -302,17 +322,7 @@ class BeliefMatching_dem:
 
         
     def decode(self, syndrome, error_rates=None, weights=None):
-
-        if isinstance(syndrome, torch.Tensor):
-            syndrome = syndrome.detach().cpu().numpy().astype(np.uint8).squeeze()
-        elif isinstance(syndrome, np.ndarray):
-            syndrome = syndrome.astype(np.uint8).squeeze()
-        elif isinstance(syndrome, list):
-            syndrome = np.array(syndrome).astype(np.uint8).squeeze()
-        
-        if syndrome.ndim == 1:
-            syndrome = syndrome[np.newaxis, :]
-
+        syndrome = _syndrome_to_numpy_batch(syndrome, np.uint8)
 
         if weights is None and error_rates is not None:
             if isinstance(error_rates, torch.Tensor):
@@ -329,7 +339,7 @@ class BeliefMatching_dem:
 
         logical_flips = self.decoder.decode_batch(syndrome)
 
-        return logical_flips.squeeze()
+        return _predictions_as_decode_batch(logical_flips)
 
     def logical_error_rate(self, syndrome, logical_ideal, error_rates=None, weights=None):
         if isinstance(logical_ideal, np.ndarray):
@@ -339,11 +349,10 @@ class BeliefMatching_dem:
         elif isinstance(logical_ideal, torch.Tensor):
             logical_ideal = logical_ideal.detach().cpu().numpy().squeeze().astype(bool)
 
-        ns = syndrome.shape[0] if syndrome.ndim > 1 else 1
-        
         logical_flip = self.decode(syndrome=syndrome, error_rates=error_rates, weights=weights)
 
-        ler = 1 - np.equal(logical_flip, logical_ideal).sum() / ns
+        logical_flip, logical_ideal = _align_logical_bits(logical_flip, logical_ideal)
+        ler = 1 - np.equal(logical_flip, logical_ideal).mean()
         return ler
 
 

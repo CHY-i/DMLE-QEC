@@ -6,6 +6,7 @@ Run all three and compare which setting makes DEM (locally) determine gate param
 
     python gate/check.py --code rep --distance 5 --rounds 3
     python gate/check.py --code both
+    python gate/check.py --code surface --surface-distance 5 --surface-rounds 5
     python gate/check.py --param-sharing elementary
 """
 
@@ -454,10 +455,22 @@ def main() -> None:
         "--code",
         choices=("rep", "surface", "both"),
         default="both",
-        help="repetition (--distance/--rounds), surface d3r3, or both",
+        help="repetition (--distance/--rounds), surface (--surface-distance/--surface-rounds), or both",
     )
     ap.add_argument("--distance", type=int, default=5, help="repetition-code distance")
     ap.add_argument("--rounds", type=int, default=3, help="repetition-code rounds")
+    ap.add_argument(
+        "--surface-distance",
+        type=int,
+        default=3,
+        help="surface_code:rotated_memory_z distance (default 3, matches prior script)",
+    )
+    ap.add_argument(
+        "--surface-rounds",
+        type=int,
+        default=3,
+        help="surface_code:rotated_memory_z measurement rounds",
+    )
     ap.add_argument("--error-prob", type=float, default=0.001)
     ap.add_argument(
         "--dem-target",
@@ -510,9 +523,10 @@ def main() -> None:
         )
 
     if args.code in ("surface", "both"):
+        sd, sr = args.surface_distance, args.surface_rounds
         run_for_circuit(
-            build_surface_code_circuit(distance=3, rounds=3, error_prob=args.error_prob),
-            label="surface_code:rotated_memory_z d=3 r=3",
+            build_surface_code_circuit(distance=sd, rounds=sr, error_prob=args.error_prob),
+            label=f"surface_code:rotated_memory_z d={sd} r={sr}",
         )
 
 

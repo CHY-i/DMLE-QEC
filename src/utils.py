@@ -19,224 +19,37 @@ class rep_dem():
         assert ((self.lx.reshape(-1) @ self.lz.reshape(-1))%2) == 1
         assert (self.pebz @ self.hx.T % 2 - np.eye(self.hx.shape[0], self.hx.shape[0])).all() == 0
 
-def build_dual_matrix(pcm, l , seperate_dual_l=False):
+def build_dual_matrix(pcm, l, seperate_dual_l=False):
+    pcm_l = np.vstack([pcm, np.atleast_2d(l)])
+    compact_var = pcm_l.sum(0) % 2
+    H = np.vstack([compact_var.reshape(1, -1), pcm_l])
+    rows, cols = H.shape
 
-    pcm_l = np.concatenate([pcm, l.reshape(1, -1)], axis=0)
-    compact_var = pcm_l.sum(0)%2
-    compact_pcm_l = np.concatenate([compact_var.reshape(1, -1), pcm_l], axis=0)
-    # print(compact_pcm_l)
-    rows, num_edges = compact_pcm_l.shape
+    G = nx.Graph()
+    G.add_nodes_from(range(rows))
+    col_to_edge = {}
+    for c in range(cols):
+        nodes = np.where(H[:, c])[0]
+        if len(nodes) == 2:
+            u, v = int(nodes[0]), int(nodes[1])
+            G.add_edge(u, v)
+            col_to_edge[tuple(sorted((u, v)))] = c
 
-    G_primal = nx.Graph()
-    G_primal.add_nodes_from(range(int(rows)))
-    
-
-    node_pair_to_edge_idx = {}
-    
-    for c in range(num_edges):
-        connected_nodes = np.where(compact_pcm_l[:, c] == 1)[0]
-
-        if len(connected_nodes) == 2:
-            u, v = int(connected_nodes[0]), int(connected_nodes[1])
-            G_primal.add_edge(u, v, id=c)
-            
-            key = tuple(sorted((u, v)))
-            node_pair_to_edge_idx[key] = c
-            
-        elif len(connected_nodes) == 1:
-
-            pass
-
-    cycles_nodes = nx.minimum_cycle_basis(G_primal)
-    
-    # Filter to only keep simple cycles (cycles where all consecutive nodes are directly connected)
-    # Non-simple cycles are cycles in the cycle space but not actual faces in the graph
-    simple_cycles_basis = []
-    for cycle in cycles_nodes:
-        is_simple = True
+    cycles = nx.minimum_cycle_basis(G)
+    hz = np.zeros((len(cycles), cols), dtype=int)
+    for i, cycle in enumerate(cycles):
         for k in range(len(cycle)):
-            u = cycle[k]
-            v = cycle[(k + 1) % len(cycle)]
-            if not G_primal.has_edge(u, v):
-                is_simple = False
-                break
-        if is_simple:
-            simple_cycles_basis.append(cycle)
-    
-    # Find all simple cycles and select linearly independent ones
-    # Expected number of faces from Euler's formula: |E| - |V| + 1
-    expected_faces = G_primal.number_of_edges() - G_primal.number_of_nodes() + 1
-    
-    # Get all simple cycles, but only consider cycles of length 3 and 4 (triangles and quadrilaterals)
-    # For the graphs we handle, only 3-edge and 4-edge faces exist
-    all_simple_cycles = list(nx.simple_cycles(G_primal))
-    
-    # Filter to only keep cycles of length 3 or 4
-    valid_cycles = [c for c in all_simple_cycles if len(c) == 3 or len(c) == 4]
-    
-    # Separate cycles by length
-    cycles_by_length = {}
-    for cycle in valid_cycles:
-        length = len(cycle)
-        if length not in cycles_by_length:
-            cycles_by_length[length] = []
-        cycles_by_length[length].append(cycle)
-    
-    # Build prioritized list: first length 3 cycles, then length 4 cycles
-    # Within each length, prioritize those in the basis
-    prioritized_cycles = []
-    basis_cycle_set = set(tuple(sorted(c)) for c in simple_cycles_basis)
-    
-    # First add length 3 cycles (triangles) - basis first, then others
-    if 3 in cycles_by_length:
-        for cycle in cycles_by_length[3]:
-            if tuple(sorted(cycle)) in basis_cycle_set:
-                prioritized_cycles.append(cycle)
-        for cycle in cycles_by_length[3]:
-            if tuple(sorted(cycle)) not in basis_cycle_set:
-                prioritized_cycles.append(cycle)
-    
-    # Then add length 4 cycles (quadrilaterals) - basis first, then others
-    if 4 in cycles_by_length:
-        for cycle in cycles_by_length[4]:
-            if tuple(sorted(cycle)) in basis_cycle_set:
-                prioritized_cycles.append(cycle)
-        for cycle in cycles_by_length[4]:
-            if tuple(sorted(cycle)) not in basis_cycle_set:
-                prioritized_cycles.append(cycle)
-    
-    all_simple_cycles = prioritized_cycles
-    
-    # Represent cycles as edge vectors (mod 2) and find linearly independent set
-    cycle_vectors = []
-    cycle_list = []
-    
-    # Helper function to represent cycle as edge vector
-    def cycle_to_vector(cycle):
-        edge_vector = np.zeros(num_edges, dtype=int)
-        for k in range(len(cycle)):
-            u = cycle[k]
-            v = cycle[(k + 1) % len(cycle)]
+            u, v = cycle[k], cycle[(k + 1) % len(cycle)]
             key = tuple(sorted((u, v)))
-            if key in node_pair_to_edge_idx:
-                e_idx = node_pair_to_edge_idx[key]
-                edge_vector[e_idx] = 1
-        return edge_vector
-    
-    # Helper function to check linear independence
-    def is_linearly_independent(edge_vector, existing_vectors):
-        if len(existing_vectors) == 0:
-            return True
-        current_matrix = np.array(existing_vectors, dtype=int) % 2
-        aug_matrix = np.vstack([current_matrix, edge_vector.reshape(1, -1)]) % 2
-        rank_current = np.linalg.matrix_rank(current_matrix)
-        rank_aug = np.linalg.matrix_rank(aug_matrix)
-        return rank_aug > rank_current
-    
-    # Helper function to check if a cycle can be expressed as XOR of smaller cycles
-    def is_elementary_face(cycle, smaller_cycles_vectors):
-        """Check if cycle is an elementary face (cannot be expressed as XOR of smaller cycles)
-        
-        Optimized version: Only checks pairs of cycles that share edges with the candidate cycle.
-        This reduces complexity from O(n^2) to O(k^2) where k is the number of cycles sharing edges.
-        """
-        if len(cycle) == 3:
-            return True  # Triangles are always elementary
-        if len(smaller_cycles_vectors) == 0:
-            return True
-        
-        cycle_vector = cycle_to_vector(cycle)
-        cycle_edges = set(np.where(cycle_vector > 0)[0])
-        
-        # Optimization: Only check cycles that share at least one edge with the candidate
-        # This dramatically reduces the number of pairs to check
-        candidate_cycles = []
-        candidate_indices = []
-        for idx, vec in enumerate(smaller_cycles_vectors):
-            vec_edges = set(np.where(vec > 0)[0])
-            if cycle_edges.intersection(vec_edges):  # Share at least one edge
-                candidate_cycles.append(vec)
-                candidate_indices.append(idx)
-        
-        # If no cycles share edges, it's definitely elementary
-        if len(candidate_cycles) == 0:
-            return True
-        
-        # Check pairs of candidate cycles (much smaller set)
-        candidate_matrix = np.array(candidate_cycles, dtype=int) % 2
-        num_candidates = len(candidate_cycles)
-        
-        # Check all pairs of candidate cycles
-        for i in range(num_candidates):
-            for j in range(i + 1, num_candidates):
-                xor_result = (candidate_matrix[i] + candidate_matrix[j]) % 2
-                if np.array_equal(cycle_vector, xor_result):
-                    return False  # Found as XOR of two smaller cycles
-        
-        # Also check if it's in the linear span (for more complex combinations)
-        # Use all smaller cycles for this check to catch any linear combination
-        smaller_matrix = np.array(smaller_cycles_vectors, dtype=int) % 2
-        aug_matrix = np.vstack([smaller_matrix, cycle_vector.reshape(1, -1)]) % 2
-        rank_smaller = np.linalg.matrix_rank(smaller_matrix)
-        rank_aug = np.linalg.matrix_rank(aug_matrix)
-        # If rank doesn't increase, it's in the span (not elementary)
-        return rank_aug > rank_smaller
-    
-    # First, add all length-3 cycles (triangles are always elementary faces)
-    length3_cycles = [c for c in prioritized_cycles if len(c) == 3]
-    for cycle in length3_cycles:
-        edge_vector = cycle_to_vector(cycle)
-        if is_linearly_independent(edge_vector, cycle_vectors):
-            cycle_vectors.append(edge_vector)
-            cycle_list.append(cycle)
-    
-    # Store length-3 cycle vectors for checking length-4 cycles
-    length3_vectors = cycle_vectors.copy()
-    
-    # Then add length-4 cycles that are elementary faces
-    # Important: Check against ALL already selected cycles (both length-3 and length-4)
-    # to ensure we don't add composite faces that can be formed by XORing existing cycles
-    length4_cycles = [c for c in prioritized_cycles if len(c) == 4]
-    for cycle in length4_cycles:
-        if len(cycle_list) >= expected_faces:
-            break
-        if cycle in cycle_list:
-            continue  # Already added
-        # Check if it's an elementary face (cannot be expressed as XOR of ANY smaller cycles)
-        # Use all cycle_vectors (including already added length-4 cycles) for checking
-        if is_elementary_face(cycle, cycle_vectors):
-            edge_vector = cycle_to_vector(cycle)
-            if is_linearly_independent(edge_vector, cycle_vectors):
-                cycle_vectors.append(edge_vector)
-                cycle_list.append(cycle)
-    
-    simple_cycles = cycle_list
-    num_faces = len(simple_cycles)
+            if key in col_to_edge:
+                hz[i, col_to_edge[key]] = 1
 
+    lz = hz.sum(0) % 2
+    lz[: cols // 2] = 0
 
-    edge_to_faces = {i: [] for i in range(num_edges)}
-    
-    for face_id, cycle in enumerate(simple_cycles):
-
-        for k in range(len(cycle)):
-            u = cycle[k]
-            v = cycle[(k + 1) % len(cycle)]
-            key = tuple(sorted((u, v)))
-            
-            if key in node_pair_to_edge_idx:
-                e_idx = node_pair_to_edge_idx[key]
-                edge_to_faces[e_idx].append(face_id)
-
-    dual_matrix = np.zeros((num_faces, num_edges), dtype=int)
-    for e_idx, faces in edge_to_faces.items():
-        for f_id in faces:
-            dual_matrix[f_id, e_idx] = 1
-    dual_l = dual_matrix.sum(0)%2
-    dual_l[:len(dual_l)//2] = 0  
     if seperate_dual_l:
-        return dual_matrix, dual_l
-    else:
-        return np.concatenate([dual_matrix, dual_l.reshape(1, -1)], axis=0)
+        return hz, lz
+    return np.vstack([hz, lz.reshape(1, -1)])
 
 
 def get_pseudo_inverse(H):
