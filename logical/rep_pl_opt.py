@@ -16,7 +16,6 @@ Run::
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -43,7 +42,24 @@ from src.decoder import MWPM_dem, Planar  # noqa: E402
 from src.model import PlanarNet  # noqa: E402
 from src.utils import get_error_rates, rep_dem  # noqa: E402
 
-LER_REPORT_DECIMALS = 6
+LER_REPORT_DECIMALS = 8
+
+
+def dem_data_root() -> Path:
+    return REPO_ROOT / "data" / "logical_qubit" / "dem"
+
+
+def dmle_stem(*, round: int, circuit_type: str, reset: int) -> str:
+    return f"dmle_r{int(round):02d}_{circuit_type}_reset{int(reset)}"
+
+
+def resolve_log_path(*, round: int, circuit_type: str, reset: int) -> Path:
+    subdir = f"{circuit_type}_reset{int(reset)}"
+    return dem_data_root() / subdir / f"{dmle_stem(round=round, circuit_type=circuit_type, reset=reset)}.txt"
+
+
+def resolve_ckpt_path(*, round: int, circuit_type: str, reset: int) -> Path:
+    return dem_data_root() / f"{dmle_stem(round=round, circuit_type=circuit_type, reset=reset)}.pt"
 
 
 def _ler_round(x: float) -> float:
@@ -259,7 +275,8 @@ def log_decode_block(
         lines[0] += f" nll={nll:.6f}"
     lines.append(
         f"  decode shots={decode['shots']} "
-        f"planar_ler={decode['planar_ler']} mwpm_dem_ler={decode['mwpm_dem_ler']}"
+        f"planar_ler={decode['planar_ler']:.{LER_REPORT_DECIMALS}f} "
+        f"mwpm_dem_ler={decode['mwpm_dem_ler']:.{LER_REPORT_DECIMALS}f}"
     )
     if priors is not None:
         lines.append(f"  priors: {priors!r}")
@@ -270,7 +287,7 @@ def log_decode_block(
 
 
 def save_checkpoint(
-    ckpt_dir: Path,
+    ckpt_path: Path,
     *,
     epoch: int,
     planar: PlanarNet,
@@ -278,8 +295,7 @@ def save_checkpoint(
     decode: dict,
     nll: float | None,
 ) -> Path:
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    path = ckpt_dir / f"epoch_{epoch:04d}.pt"
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
         priors = planar.get_priors().detach().cpu()
     torch.save(
@@ -291,11 +307,9 @@ def save_checkpoint(
             "decode": decode,
             "dem_text": str(dem),
         },
-        path,
+        ckpt_path,
     )
-    meta = ckpt_dir / f"epoch_{epoch:04d}_decode.json"
-    meta.write_text(json.dumps(decode, indent=2) + "\n", encoding="utf-8")
-    return path
+    return ckpt_path
 
 
 def train_dmle_on_det(
@@ -312,13 +326,13 @@ def train_dmle_on_det(
     lr: float,
     perturb_init: bool,
     log_path: Path,
+    ckpt_path: Path,
     checkpoint_every: int,
     decode_mini_batch: int,
     max_decode_shots: int | None,
     device: str,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    ckpt_dir = log_path.parent / "checkpoints" / log_path.stem
     dtype = torch.float64
 
     if dets.shape[0] != obs.shape[0]:
@@ -382,7 +396,7 @@ def train_dmle_on_det(
             priors=baseline_er.detach().cpu().numpy(),
         )
         save_checkpoint(
-            ckpt_dir,
+            ckpt_path,
             epoch=0,
             planar=planar,
             dem=dem,
@@ -423,10 +437,9 @@ def train_dmle_on_det(
                     epoch=epoch,
                     nll=nll,
                     decode=decode,
-                    priors=priors.detach().cpu().numpy(),
                 )
-                ckpt_path = save_checkpoint(
-                    ckpt_dir,
+                save_checkpoint(
+                    ckpt_path,
                     epoch=epoch,
                     planar=planar,
                     dem=dem,
@@ -441,7 +454,7 @@ def train_dmle_on_det(
         log.write(repr(opt_er) + "\n")
         log.flush()
 
-        final_path = log_path.with_suffix(".pt")
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
                 "distance": distance,
@@ -450,12 +463,13 @@ def train_dmle_on_det(
                 "reset": reset,
                 "baseline_er": baseline_er.detach().cpu(),
                 "optimized_er": torch.tensor(opt_er),
+                "error_rates": torch.tensor(opt_er),
                 "planar_state_dict": planar.state_dict(),
                 "dem_text": str(dem),
             },
-            final_path,
+            ckpt_path,
         )
-        print(f"[done] weights → {final_path}", flush=True)
+        print(f"[done] weights → {ckpt_path}", flush=True)
 
 
 def main() -> None:
@@ -501,8 +515,16 @@ def main() -> None:
     )
     print(f"[data] dets {dets.shape}, obs {obs.shape}", flush=True)
 
-    log_dir = REPO_ROOT / "log" / "rep" / "logical"
-    log_path = log_dir / f"dmle_r{args.round:02d}_{args.circuit_type}_reset{args.reset}_e{args.epochs}.txt"
+    log_path = resolve_log_path(
+        round=args.round,
+        circuit_type=args.circuit_type,
+        reset=args.reset,
+    )
+    ckpt_path = resolve_ckpt_path(
+        round=args.round,
+        circuit_type=args.circuit_type,
+        reset=args.reset,
+    )
 
     train_dmle_on_det(
         dets=dets,
@@ -517,6 +539,7 @@ def main() -> None:
         lr=args.lr,
         perturb_init=args.perturb_init,
         log_path=log_path,
+        ckpt_path=ckpt_path,
         checkpoint_every=args.checkpoint_every,
         decode_mini_batch=args.decode_mini_batch,
         max_decode_shots=args.max_decode_shots,

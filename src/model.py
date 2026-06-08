@@ -153,29 +153,60 @@ def prob_tensor(degree, p, connect_to_l=False):
 
 
 class TensorNetwork(nn.Module):
-    def __init__(self, pcm, l=None, priors_logits=None, dev='cpu', dtype=torch.float32, decoding=False):
+    def __init__(
+        self, 
+        pcm, 
+        l=None, 
+        priors_logits=None, 
+        dev='cpu', 
+        dtype=torch.float32, 
+        decoding=False,
+        learn_priors=True  # [新增] 决定本层参数是否可学习
+    ):
         super().__init__()
         self.pcm = pcm
-        self.l=l
+        self.l = l
         self.dev = dev
         self.dtype = dtype
-        self.decoding=decoding
+        self.decoding = decoding
+        self.learn_priors = learn_priors # [新增]
         self.n_check, self.n_bit = pcm.shape
+        
+        # [修改] 仿照 PlanarNet 处理参数：可学习时用 Parameter，否则用 buffer
         if priors_logits is None:
-            self.priors_logits = nn.Parameter(torch.randn(pcm.shape[1]))
+            init_logits = torch.randn(self.n_bit, dtype=dtype, device=dev)
         else:
-            self.priors_logits = nn.Parameter(priors_logits.to(dev).to(dtype))
+            init_logits = priors_logits.detach().to(dev).to(dtype)
+            
+        if self.learn_priors:
+            self.priors_logits = nn.Parameter(init_logits.clone())
+        else:
+            self.register_buffer("priors_logits", init_logits.clone())
+            
         self.path = None
         self.tree = None
 
         self.generate_xor_tensors()
-
         self.generate_equation()
 
-        pass
+    # [新增] 仿照 PlanarNet 解析优先概率
+    def _resolve_priors(self, priors: torch.Tensor | None) -> torch.Tensor:
+        """
+        处理内部或外部传入的先验概率。
+        如果是外部传入（如 GateNoiseToDEM 输出），假定其已经是概率空间 [0, 1] 内的值。
+        如果是内部参数，则走 sigmoid 激活。
+        """
+        if priors is not None:
+            # 使用外部传入的底层概率（不需要再过 sigmoid）
+            return priors.to(device=self.dev, dtype=self.dtype).clamp(1e-20, 1.0 - 1e-20)
+        
+        if not self.learn_priors:
+            raise RuntimeError("learn_priors=False: you must provide external priors (probs) during forward()")
+            
+        # 使用内部学习的对数几率转概率
+        return torch.sigmoid(self.priors_logits).clamp(1e-20, 1.0 - 1e-20)
 
     def generate_xor_tensors(self):
- 
         degree_xor = self.pcm.sum(axis=1)
         self.xor_list = []
         
@@ -224,7 +255,6 @@ class TensorNetwork(nn.Module):
         for syms in bit_conn_symbols:
             lhs_terms.append("".join(syms))
             
-
         for sym in syndrome_symbols:
             lhs_terms.append('...'+sym)
             
@@ -234,20 +264,20 @@ class TensorNetwork(nn.Module):
         self.eq_str = f"{lhs}->{rhs}"
         
     def generate_prob_tensors(self, probs):
-        # 保持不变
         tensor_list = []
         degree_prob = self.pcm.sum(axis=0)
         for j in range(self.n_bit):
             degree = int(degree_prob[j])
             p = probs[j]
-            if self.decoding and self.l[j] ==1 :
+            if self.decoding and self.l[j] == 1:
                 pt = prob_tensor(degree, p, connect_to_l=True).to(self.dev).to(self.dtype)
             else:
                 pt = prob_tensor(degree, p).to(self.dev).to(self.dtype)
             tensor_list.append(pt)
         return tensor_list
     
-    def decoding_forward(self, syndromes, probs=None):
+    # [修改] 接口参数改为 priors
+    def decoding_forward(self, syndromes, priors=None):
         path = self.path
         tree = self.tree
         is_batched = syndromes.ndim == 2
@@ -256,12 +286,9 @@ class TensorNetwork(nn.Module):
         syndrome_onehot = torch.nn.functional.one_hot(syndromes.long(), num_classes=2).to(dtype=self.dtype, device=self.dev) 
         syndrome_vectors = list(syndrome_onehot.unbind(dim=1))  
         
+        # [修改] 使用 _resolve_priors 统一解析概率
+        probs = self._resolve_priors(priors)
         
-        if probs == None:   
-            probs = torch.sigmoid(self.priors_logits)
-        else:
-            None
-        # print(probs)
         scaled_prob_tensors = []
         log_scale_factor = 0.0 
         raw_prob_tensors = self.generate_prob_tensors(probs)
@@ -285,7 +312,8 @@ class TensorNetwork(nn.Module):
             p0_minus_p1 = oe.contract(self.eq_str, *operands, optimize=optimize_arg)
         return (1-p0_minus_p1.sign())/2
 
-    def forward(self, syndromes, priors_logits=None):
+    # [修改] 接口参数从 priors_logits 改为 priors
+    def forward(self, syndromes, priors=None):
         path = self.path
         tree = self.tree
         is_batched = syndromes.ndim == 2
@@ -294,11 +322,10 @@ class TensorNetwork(nn.Module):
 
         syndrome_onehot = torch.nn.functional.one_hot(syndromes.long(), num_classes=2).to(dtype=self.dtype, device=self.dev)
         syndrome_vectors = list(syndrome_onehot.unbind(dim=1))
-        if priors_logits == None:   
-            probs = torch.sigmoid(self.priors_logits)
-        else:
-            # self.priors_logits=None
-            probs = torch.sigmoid(priors_logits)
+        
+        # [修改] 使用 _resolve_priors 统一解析概率
+        probs = self._resolve_priors(priors)
+        
         scaled_prob_tensors = []
         log_scale_factor = 0.0 
         raw_prob_tensors = self.generate_prob_tensors(probs)
@@ -327,11 +354,7 @@ class TensorNetwork(nn.Module):
     
 
     def find_contraction_path(self, batch_size=50, max_time=600):
-        """
-        Args:
-            batch_size (int): 假设的 Batch Size
-            max_time (int): cotengra 搜索路径的最长时间（秒）。时间越长，路径越好。
-        """
+        # 保持不变...
         import cotengra as ctg
         shapes = []
 
@@ -351,17 +374,13 @@ class TensorNetwork(nn.Module):
 
         print(f"Searching for contraction path using Cotengra (max_time={max_time}s)...")
 
-        # --- 配置 Cotengra ---
-        # minimize: 'flops' (计算最快) 或 'write' (总写入量) 或 'size' (峰值显存最小)
-        # 对于显存不足的情况，建议优先尝试 'flops'，如果爆显存则改为 'size'
         opt = ctg.HyperOptimizer(
             max_time=max_time, 
-            max_repeats=128,    # 尝试多少次搜索
-            minimize='size',    # 优化目标
-            progbar=True,        # 显示进度条
+            max_repeats=128,
+            minimize='size',
+            progbar=True,
             parallel=120,
         )
-
 
         path, path_info = oe.contract_path(self.eq_str, *shapes, optimize=opt, shapes=True)
         
@@ -373,19 +392,15 @@ class TensorNetwork(nn.Module):
         max_tensor_gb = (path_info.largest_intermediate * 8) / (1024**3)
         print(f"3. Peak Memory:            {max_tensor_gb:.2f} GB")
         
-        # ================= 新增的判断逻辑 =================
         if space_complexity >= 30:
             print(f"❌ 警告: 找到的路径 Space Complexity ({space_complexity:.2f}) 达到或超过 30！")
             print("这会导致极高的显存占用，拒绝采用该路径。")
             return None
-        # ==================================================
         
         return path
 
     def save_path(self, path, filename="best_contraction_path.pkl"):
-
         import pickle  
-
         try:
             with open(filename, 'wb') as f:
                 pickle.dump(path, f)
@@ -393,9 +408,7 @@ class TensorNetwork(nn.Module):
         except Exception as e:
             print(f"Error saving path: {e}")
 
-    # --- 新增：加载路径 ---
     def load_path(self, filename="best_contraction_path.pkl"):
-
         import pickle
         import os
         if not os.path.exists(filename):
@@ -412,7 +425,6 @@ class TensorNetwork(nn.Module):
 
     def load_tree(self, filename):
         import json
-
         import os
         if not os.path.exists(filename):
             raise FileNotFoundError(f"Tree file '{filename}' not found.")
@@ -426,6 +438,7 @@ class TensorNetwork(nn.Module):
             print(f"Error loading path: {e}")
             self.tree = None
 
+            
     
 class GroupTN(nn.Module):
     def __init__(self, d, r, sub_pcms, sub_dets, sub_errors, init_priors, dev='cpu', dtype=torch.float32):

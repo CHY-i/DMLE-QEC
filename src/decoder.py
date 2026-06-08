@@ -374,7 +374,7 @@ class TensorNetworkDecoder:
         elif isinstance(error_rates, list):
             error_rates = torch.tensor(error_rates, dtype=torch.float64, device=self.dev)
 
-        logical_flip= self.model.decoding_forward(syndrome, probs=error_rates)
+        logical_flip = self.model.decoding_forward(syndrome, priors=error_rates)
         return logical_flip
 
     def logical_error_rate(self, syndrome, logical_ideal, error_rates):

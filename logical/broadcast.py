@@ -155,15 +155,15 @@ def broadcast_repetition_dem_learned(
     ``build_stim_circuit(..., cycle=r_tgt, ...)`` but error probabilities are taken from
     the learned ``r_src`` DEM using the repetition tiling rules above.
 
-    Currently implemented for ``circuit_type == "phase_flip"`` and ``reset is False``.
+    Currently implemented for ``circuit_type == "phase_flip"``.
     """
     if circuit_type.replace("_", " ") != "phase flip":
         raise NotImplementedError("only phase_flip is implemented for repetition broadcast")
-    if reset:
-        raise NotImplementedError("only reset=False is implemented for repetition broadcast")
 
     d1 = distance - 1
-    dem_src = _lab_circuit(distance=distance, rounds=r_src, circuit_type="phase_flip", reset=False).detector_error_model()
+    dem_src = _lab_circuit(
+        distance=distance, rounds=r_src, circuit_type="phase_flip", reset=reset
+    ).detector_error_model()
     if error_rates.shape[0] != dem_src.num_errors:
         raise ValueError(
             f"error_rates length {error_rates.shape[0]} != r={r_src} DEM num_errors {dem_src.num_errors}"
@@ -171,7 +171,9 @@ def broadcast_repetition_dem_learned(
     dem_src = update_dem(dem_src, error_rates)
     pair, single, det_obs = _index_learned_dem(dem_src)
 
-    dem_tgt = _lab_circuit(distance=distance, rounds=r_tgt, circuit_type="phase_flip", reset=False).detector_error_model()
+    dem_tgt = _lab_circuit(
+        distance=distance, rounds=r_tgt, circuit_type="phase_flip", reset=reset
+    ).detector_error_model()
     if dem_tgt.num_errors != _expected_num_errors_phase_flip_reset0(distance=distance, rounds=r_tgt):
         raise RuntimeError(
             "unexpected num_errors for native r_tgt DEM; update _expected_num_errors_phase_flip_reset0"
@@ -233,7 +235,7 @@ def main() -> None:
         help="Output directory (same naming style as training logs).",
     )
     ap.add_argument("--circuit-type", type=str, default="phase_flip", choices=["phase_flip"])
-    ap.add_argument("--reset", type=int, default=0, choices=[0])
+    ap.add_argument("--reset", type=int, default=0, choices=[0, 1])
     args = ap.parse_args()
 
     pt_path = args.pt.resolve()
@@ -241,9 +243,12 @@ def main() -> None:
         raise FileNotFoundError(pt_path)
 
     loaded = torch.load(pt_path, map_location="cpu")
-    if "error_rates" not in loaded:
-        raise KeyError(f"{pt_path} must contain 'error_rates' tensor.")
-    er = np.asarray(loaded["error_rates"], dtype=np.float64).reshape(-1)
+    if "error_rates" in loaded:
+        er = np.asarray(loaded["error_rates"], dtype=np.float64).reshape(-1)
+    elif "optimized_er" in loaded:
+        er = np.asarray(loaded["optimized_er"], dtype=np.float64).reshape(-1)
+    else:
+        raise KeyError(f"{pt_path} must contain 'error_rates' or 'optimized_er' tensor.")
 
     d = int(args.distance)
     r0 = int(args.source_round)

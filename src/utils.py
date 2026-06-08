@@ -1,5 +1,6 @@
 import networkx as nx
 import numpy as np
+from collections import defaultdict, deque
 from math import atan2, pi, log
 import scipy
 from scipy.sparse import lil_matrix
@@ -19,30 +20,209 @@ class rep_dem():
         assert ((self.lx.reshape(-1) @ self.lz.reshape(-1))%2) == 1
         assert (self.pebz @ self.hx.T % 2 - np.eye(self.hx.shape[0], self.hx.shape[0])).all() == 0
 
+def _graph_from_parity_matrix(H):
+    """Build indexed adjacency list and edge-to-column map from a binary parity matrix."""
+    rows, cols = H.shape
+    adj = [[] for _ in range(rows)]
+    col_to_edge = {}
+    edge_nodes = []
+    col_nodes = defaultdict(list)
+    for r, c in np.argwhere(H):
+        col_nodes[int(c)].append(int(r))
+    for c, nodes in col_nodes.items():
+        if len(nodes) == 2:
+            u, v = nodes
+            edge_id = len(edge_nodes)
+            edge_nodes.append((u, v))
+            adj[u].append((v, edge_id))
+            adj[v].append((u, edge_id))
+            col_to_edge[edge_id] = c
+    return adj, col_to_edge, np.array(edge_nodes, dtype=np.int32)
+
+
+def _spanning_tree_chord_ids(adj, n_nodes, n_edges):
+    """DFS spanning tree; return edge ids of non-tree (chord) edges."""
+    in_tree = np.zeros(n_edges, dtype=np.bool_)
+    seen = [False] * n_nodes
+    stack = [0]
+    seen[0] = True
+    while stack:
+        u = stack.pop()
+        for v, edge_id in adj[u]:
+            if not seen[v]:
+                seen[v] = True
+                in_tree[edge_id] = True
+                stack.append(v)
+    return np.flatnonzero(~in_tree)
+
+
+def _precompute_triangles(adj, n_nodes):
+    """All triangle edge-id triples in an undirected simple graph."""
+    triangles = []
+    for u in range(n_nodes):
+        nbrs_u = {v: edge_id for v, edge_id in adj[u]}
+        for v, e_uv in adj[u]:
+            if v <= u:
+                continue
+            for w, e_vw in adj[v]:
+                e_wu = nbrs_u.get(w)
+                if e_wu is not None:
+                    triangles.append((e_uv, e_vw, e_wu))
+    return triangles
+
+
+def _min_triangle_orthogonal(triangles, orth_mask):
+    """Return the first triangle whose edge set has odd overlap with ``orth_mask``."""
+    for e1, e2, e3 in triangles:
+        if (int(orth_mask[e1]) + int(orth_mask[e2]) + int(orth_mask[e3])) % 2:
+            return {e1, e2, e3}
+    return None
+
+
+def _min_weight_cycle_orthogonal_bfs(adj, n_nodes, orth_mask):
+    """
+    Minimum-length cycle orthogonal to ``orth_mask`` via lifted-graph BFS.
+
+    Fallback for graphs where the fast triangle shortcut does not apply.
+    """
+    best_len = None
+    best_prev = None
+    best_target = None
+
+    for start in range(n_nodes):
+        target = start + n_nodes
+        dist = [-1] * (2 * n_nodes)
+        prev = [-1] * (2 * n_nodes)
+        dist[start] = 0
+        queue = deque([start])
+        while queue:
+            node = queue.popleft()
+            if node == target:
+                break
+            if best_len is not None and dist[node] >= best_len:
+                continue
+            base = node if node < n_nodes else node - n_nodes
+            lifted = node >= n_nodes
+            for nbr, edge_id in adj[base]:
+                cross = orth_mask[edge_id]
+                if lifted:
+                    nxt = nbr if cross else nbr + n_nodes
+                else:
+                    nxt = nbr + n_nodes if cross else nbr
+                if dist[nxt] == -1:
+                    dist[nxt] = dist[node] + 1
+                    prev[nxt] = node
+                    queue.append(nxt)
+
+        path_len = dist[target]
+        if path_len != -1 and (best_len is None or path_len < best_len):
+            best_len = path_len
+            best_prev = prev
+            best_target = target
+
+    path = []
+    cur = best_target
+    while cur != -1:
+        path.append(cur)
+        cur = best_prev[cur]
+    path.reverse()
+
+    nodes = [p if p < n_nodes else p - n_nodes for p in path]
+    edge_ids = set()
+    for i in range(len(nodes) - 1):
+        u, v = nodes[i], nodes[i + 1]
+        for nbr, edge_id in adj[u]:
+            if nbr == v:
+                if edge_id in edge_ids:
+                    edge_ids.remove(edge_id)
+                else:
+                    edge_ids.add(edge_id)
+                break
+    return edge_ids
+
+
+def _min_weight_cycle_orthogonal(adj, n_nodes, orth_mask, triangles):
+    """Minimum cycle orthogonal to ``orth_mask``; triangle fast-path with BFS fallback."""
+    cycle = _min_triangle_orthogonal(triangles, orth_mask)
+    if cycle is not None:
+        return cycle
+    return _min_weight_cycle_orthogonal_bfs(adj, n_nodes, orth_mask)
+
+
+def _edge_ids_to_node_cycle(edge_ids, edge_nodes):
+    """Convert cycle edge ids into an ordered node list."""
+    graph = defaultdict(list)
+    for edge_id in edge_ids:
+        u, v = map(int, edge_nodes[edge_id])
+        graph[u].append(v)
+        graph[v].append(u)
+
+    start = int(edge_nodes[next(iter(edge_ids))][0])
+    cycle = [start]
+    prev = None
+    cur = start
+    while True:
+        nbrs = [x for x in graph[cur] if x != prev]
+        if not nbrs:
+            break
+        nxt = nbrs[0]
+        if nxt == start and len(cycle) > 2:
+            break
+        cycle.append(nxt)
+        prev, cur = cur, nxt
+        if len(cycle) > len(edge_ids) + 5:
+            break
+    return cycle
+
+
+def _minimum_cycle_basis_fast(adj, n_nodes, edge_nodes):
+    """Unweighted minimum cycle basis via de Pina's algorithm."""
+    n_edges = edge_nodes.shape[0]
+    triangles = _precompute_triangles(adj, n_nodes)
+    chord_ids = _spanning_tree_chord_ids(adj, n_nodes, n_edges)
+    orth_masks = []
+    for edge_id in chord_ids:
+        mask = np.zeros(n_edges, dtype=np.bool_)
+        mask[edge_id] = True
+        orth_masks.append(mask)
+
+    cycles = []
+    while orth_masks:
+        base = orth_masks.pop()
+        cycle_edge_ids = _min_weight_cycle_orthogonal(adj, n_nodes, base, triangles)
+        cycles.append(_edge_ids_to_node_cycle(cycle_edge_ids, edge_nodes))
+
+        updated = []
+        for orth in orth_masks:
+            parity = 0
+            for edge_id in cycle_edge_ids:
+                parity ^= int(orth[edge_id])
+            if parity:
+                updated.append(np.logical_xor(orth, base))
+            else:
+                updated.append(orth)
+        orth_masks = updated
+
+    return cycles
+
+
 def build_dual_matrix(pcm, l, seperate_dual_l=False):
     pcm_l = np.vstack([pcm, np.atleast_2d(l)])
     compact_var = pcm_l.sum(0) % 2
     H = np.vstack([compact_var.reshape(1, -1), pcm_l])
     rows, cols = H.shape
 
-    G = nx.Graph()
-    G.add_nodes_from(range(rows))
-    col_to_edge = {}
-    for c in range(cols):
-        nodes = np.where(H[:, c])[0]
-        if len(nodes) == 2:
-            u, v = int(nodes[0]), int(nodes[1])
-            G.add_edge(u, v)
-            col_to_edge[tuple(sorted((u, v)))] = c
+    adj, col_to_edge, edge_nodes = _graph_from_parity_matrix(H)
+    cycles = _minimum_cycle_basis_fast(adj, rows, edge_nodes)
 
-    cycles = nx.minimum_cycle_basis(G)
-    hz = np.zeros((len(cycles), cols), dtype=int)
+    hz = np.zeros((len(cycles), cols), dtype=np.int8)
     for i, cycle in enumerate(cycles):
         for k in range(len(cycle)):
             u, v = cycle[k], cycle[(k + 1) % len(cycle)]
-            key = tuple(sorted((u, v)))
-            if key in col_to_edge:
-                hz[i, col_to_edge[key]] = 1
+            for nbr, edge_id in adj[u]:
+                if nbr == v:
+                    hz[i, col_to_edge[edge_id]] = 1
+                    break
 
     lz = hz.sum(0) % 2
     lz[: cols // 2] = 0
@@ -322,11 +502,11 @@ class rep_cir():
 
 
 def get_error_rates(dem):
-    num_ems = dem.num_errors   
-    er = []
-    for i in range(num_ems):
-        er.append(dem[i].args_copy()[0])
-    return np.array(er)
+    """One probability per ``error`` instruction, in DEM traversal order."""
+    return np.array(
+        [float(inst.args_copy()[0]) for inst in dem if inst.type == "error"],
+        dtype=np.float64,
+    )
 
 def get_weights(dem):
     num_ems = dem.num_errors   
@@ -483,17 +663,23 @@ def PCM(dem):
 
 def update_dem(dem, ers):
     new_dem = stim.DetectorErrorModel()
-    for i, instruction in enumerate(dem):
-    # print(instruction.type)
-        if instruction.type == "error":  
-            args = instruction.args_copy()
-            targets = instruction.targets_copy()
-            new_p = ers[i]  
-            new_dem.append(stim.DemInstruction(
-                "error",  
-                args=[new_p],
-                targets=targets
-            ))
+    ers = np.asarray(ers, dtype=np.float64).reshape(-1)
+    if ers.shape[0] != dem.num_errors:
+        raise ValueError(
+            f"update_dem: len(ers)={ers.shape[0]} != dem.num_errors={dem.num_errors}"
+        )
+    error_idx = 0
+    for instruction in dem:
+        if instruction.type == "error":
+            new_p = float(ers[error_idx])
+            error_idx += 1
+            new_dem.append(
+                stim.DemInstruction(
+                    "error",
+                    args=[new_p],
+                    targets=instruction.targets_copy(),
+                )
+            )
         else:
             new_dem.append(instruction)
     return new_dem

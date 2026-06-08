@@ -1,16 +1,16 @@
 """
-Optimize repetition-code **gate** noise via GateNoiseToDEM + PlanarNet.
+Optimize surface-code **gate** noise via GateNoiseToDEM + TensorNetwork.
 
-Uses Stim ``repetition_code:memory`` (ideal) + noise from ``tqec.NoiseModel`` (no HDF5).
+Uses Stim ``surface_code:rotated_memory_z`` + noise from ``tqec.NoiseModel`` (no HDF5).
 Detection events are sampled from the circuit DEM; learnable parameters are the
 gate noise rates in :class:`src.g2dem.GateNoiseToDEM` (default: ``time_shared``). Each step:
 
-    gate_probs → g2d() → DEM error probabilities → PlanarNet NLL
+    gate_probs → g2d() → DEM error probabilities → TensorNetwork NLL
 
 Run from repo root::
 
-    python gate/pl_opt.py --distance 3 --rounds 5 --epochs 500 --device cuda:7
-    python gate/pl_opt.py --noise-model si1000 --error-prob 0.001
+    python gate/tn_opt_surf.py --distance 3 --rounds 3 --epochs 500 --device cuda:0
+    python gate/tn_opt_surf.py --noise-model si1000 --error-prob 0.001
 """
 
 from __future__ import annotations
@@ -26,19 +26,20 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-LOG_DIR = REPO_ROOT / "gate" / "log" / "rep" / "sim"
-CHECKPOINT_DIR = REPO_ROOT / "gate" / "log" / "rep" / "sim" / "checkpoint"
+LOG_DIR = REPO_ROOT / "gate" / "log" / "sur" / "sim"
+CHECKPOINT_DIR = REPO_ROOT / "gate" / "log" / "sur" / "sim" / "checkpoint"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.g2dem import GateNoiseToDEM, ParamSharing  # noqa: E402
-from src.model import PlanarNet  # noqa: E402
-from src.utils import get_error_rates, rep_cir  # noqa: E402
+from src.model import TensorNetwork  # noqa: E402
+from src.utils import PCM  # 直接使用你的 PCM 函数
+
 
 NoiseModelKind = Literal["depolarizing", "si1000"]
 
 
-def build_repetition_circuit_depolarizing(
+def build_surface_circuit_depolarizing(
     *,
     distance: int,
     rounds: int,
@@ -46,7 +47,7 @@ def build_repetition_circuit_depolarizing(
 ) -> stim.Circuit:
     """Uniform depolarizing noise via ``stim.Circuit.generated``."""
     return stim.Circuit.generated(
-        code_task="repetition_code:memory",
+        code_task="surface_code:rotated_memory_z",
         distance=distance,
         rounds=rounds,
         after_clifford_depolarization=error_prob,
@@ -57,7 +58,7 @@ def build_repetition_circuit_depolarizing(
 
 
 def noise_model_si1000(p: float):
-    """``tqec.NoiseModel.si1000`` plus ``MR``/``M`` rules (Stim generated circuits use ``MR``)."""
+    """``tqec.NoiseModel.si1000`` plus ``MR``/``M`` rules."""
     from tqec import NoiseModel
     from tqec.utils.noise_model import NoiseRule
 
@@ -71,20 +72,15 @@ def noise_model_si1000(p: float):
     return nm
 
 
-def noise_model_si1000_repetition(p: float):
-    """Alias for :func:`noise_model_si1000` (repetition + surface)."""
-    return noise_model_si1000(p)
-
-
-def build_repetition_circuit_si1000(
+def build_surface_circuit_si1000(
     *,
     distance: int,
     rounds: int,
     error_prob: float,
 ) -> stim.Circuit:
-    """Ideal repetition memory circuit + SI1000 noise from ``tqec``."""
+    """Ideal surface memory circuit + SI1000 noise from ``tqec``."""
     ideal = stim.Circuit.generated(
-        code_task="repetition_code:memory",
+        code_task="surface_code:rotated_memory_z",
         distance=distance,
         rounds=rounds,
     )
@@ -99,11 +95,11 @@ def build_circuit(
     noise_model: NoiseModelKind,
 ) -> stim.Circuit:
     if noise_model == "depolarizing":
-        return build_repetition_circuit_depolarizing(
+        return build_surface_circuit_depolarizing(
             distance=distance, rounds=rounds, error_prob=error_prob
         )
     if noise_model == "si1000":
-        return build_repetition_circuit_si1000(
+        return build_surface_circuit_si1000(
             distance=distance, rounds=rounds, error_prob=error_prob
         )
     raise ValueError(f"unknown noise_model={noise_model!r}")
@@ -117,7 +113,7 @@ def default_log_filename(
     param_sharing: ParamSharing,
     noise_model: NoiseModelKind,
 ) -> str:
-    return f"rep_d{distance}r{rounds}_p{error_prob}_{noise_model}_{param_sharing}.txt"
+    return f"surf_tn_d{distance}r{rounds}_p{error_prob}_{noise_model}_{param_sharing}.txt"
 
 
 def resolve_log_path(
@@ -189,7 +185,6 @@ def log_checkpoint(
     gate_err = relative_error_stats(
         torch.tensor(gate_p), true_gate.cpu()
     )
-    # true_dem is g2d(true_gate) at setup — same map as dem_p, so ~0 when gate unchanged.
     dem_err = relative_error_stats(
         torch.tensor(dem_p), true_dem.cpu()
     )
@@ -230,14 +225,16 @@ def setup_models(
     dtype: torch.dtype,
     perturb_init: bool,
     param_sharing: ParamSharing,
-) -> tuple[GateNoiseToDEM, PlanarNet, torch.Tensor, torch.Tensor, torch.Tensor]:
+    mini_batch: int,
+    ctg_max_time: int,
+) -> tuple[GateNoiseToDEM, TensorNetwork, torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
+    
     dem = circuit.detector_error_model(decompose_errors=False, flatten_loops=True)
-    rep = rep_cir(distance, rounds)
-    rep.reorder(dem)
-
-    ref_er = torch.tensor(get_error_rates(dem), dtype=dtype, device=device)
-    if ref_er.numel() != rep.n:
-        raise RuntimeError(f"DEM has {ref_er.numel()} errors but rep_cir.n={rep.n}")
+    
+    # ----------------------------------------------------
+    # 调用你的 src.utils 中的 PCM 函数
+    pcm, l = PCM(dem)
+    # ----------------------------------------------------
 
     g2d = GateNoiseToDEM(
         circuit,
@@ -247,8 +244,10 @@ def setup_models(
         dtype=dtype,
         device=device,
     )
-    if g2d.num_dem != rep.n:
-        raise RuntimeError(f"g2d.num_dem={g2d.num_dem} != rep.n={rep.n}")
+    
+    # 维度一致性检查 (验证 GateNoiseToDEM 的错误数是否匹配 PCM 的列数)
+    if g2d.num_dem != pcm.shape[1]:
+        raise RuntimeError(f"g2d.num_dem={g2d.num_dem} != pcm.cols={pcm.shape[1]}")
 
     true_gate = g2d.gate_probs().detach().clone()
     with torch.no_grad():
@@ -257,16 +256,31 @@ def setup_models(
 
     if perturb_init:
         with torch.no_grad():
-            init_gate = perturb_probabilities_like_pl_opt(true_gate)
-            g2d.gate_param.copy_(prob_to_logit(init_gate))
-
-    planar = PlanarNet(
-        abstract_code=rep,
-        init_priors=ref_er,
+            # 1. 提取当前 24 个可学习参数（Slots）的实际概率
+            init_slot_probs = torch.sigmoid(g2d.gate_param)
+            
+            # 2. 仅对这 24 个独立参数进行随机扰动
+            perturbed_slots = perturb_probabilities_like_pl_opt(init_slot_probs)
+            
+            # 3. 将扰动后的概率转回 logit 空间并写回 gate_param
+            g2d.gate_param.copy_(prob_to_logit(perturbed_slots))
+            
+    # Construct TensorNetwork
+    # 设置 learn_priors=False，因为底层的 GateNoiseToDEM 将提供可微的先验概率
+    tn = TensorNetwork(
+        pcm=pcm,
+        l=l[0] if l.shape[0] > 0 else None, 
         dev=device,
-        learn_priors=False,
+        dtype=dtype,
+        learn_priors=False 
     )
-    return g2d, planar, true_gate, true_dem, stim_dem
+    
+    # 自动搜寻张量收缩路径
+    tn.path = tn.find_contraction_path(batch_size=mini_batch, max_time=ctg_max_time)
+    if tn.path is None:
+        raise RuntimeError("Cotengra could not find a feasible TN contraction path (memory limit exceeded).")
+
+    return g2d, tn, true_gate, true_dem, stim_dem, pcm
 
 
 def train(
@@ -280,6 +294,7 @@ def train(
     epochs: int,
     batch_size: int,
     mini_batch: int,
+    ctg_max_time: int,
     lr: float,
     perturb_init: bool,
     device: str,
@@ -297,9 +312,8 @@ def train(
         noise_model=noise_model,
     )
     dets = sample_detection_events(circuit, num_shots=num_shots, seed=seed)
-    print(f"[data] {num_shots} shots, {dets.shape[1]} detectors", flush=True)
-
-    g2d, planar, true_gate, true_dem, stim_dem = setup_models(
+    
+    g2d, tn, true_gate, true_dem, stim_dem, pcm = setup_models(
         circuit,
         distance=distance,
         rounds=rounds,
@@ -307,7 +321,29 @@ def train(
         dtype=dtype,
         perturb_init=perturb_init,
         param_sharing=param_sharing,
+        mini_batch=mini_batch,
+        ctg_max_time=ctg_max_time,
     )
+
+    # ----------------------------------------------------
+    # 【对齐数据维度】
+    # 你的 PCM 函数自动过滤了全 0 行，这意味着 pcm.shape[0] 可能小于 dem.num_detectors
+    # 如果发生了过滤，我们必须在送入 Dataset 之前切片掉 dets 中无效的对应列，否则网络维度会崩溃
+    original_num_detectors = dets.shape[1]
+    if pcm.shape[0] != original_num_detectors:
+        print(f"[warning] PCM filtered out zero-rows. Aligning detection events from {original_num_detectors} -> {pcm.shape[0]} detectors.")
+        # 重新提取一下非零行索引来切片 dets
+        dem_temp = circuit.detector_error_model(decompose_errors=False, flatten_loops=True)
+        raw_pcm = np.zeros([dem_temp.num_detectors, dem_temp.num_errors])
+        for i, e in enumerate(dem_temp[:dem_temp.num_errors]):
+            for t in e.targets_copy():
+                D = str(t)
+                if D.startswith('D'):
+                    raw_pcm[int(D[1:]), i] = 1
+        non_zero_rows = np.where(raw_pcm.sum(axis=1) != 0)[0]
+        dets = dets[:, non_zero_rows]
+    # ----------------------------------------------------
+    print(f"[data] {num_shots} shots, {dets.shape[1]} detectors (aligned with PCM)", flush=True)
 
     optim = torch.optim.AdamW(g2d.parameters(), lr=lr, weight_decay=0.01)
 
@@ -321,7 +357,7 @@ def train(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "w", encoding="utf-8") as log:
         log.write(
-            f"# repetition_code:memory d={distance} r={rounds} p={error_prob} "
+            f"# surface_code:rotated_memory_z d={distance} r={rounds} p={error_prob} "
             f"noise_model={noise_model}\n"
             f"# param_sharing={param_sharing} gate_params={g2d.num_slots} "
             f"elementary_sites={g2d.num_elementary}\n"
@@ -348,7 +384,7 @@ def train(
 
         with torch.no_grad():
             probe = torch.from_numpy(dets[:mini_batch]).to(device=device, dtype=dtype)
-            init_nll = float(planar(probe, priors=g2d()).item())
+            init_nll = float(tn(probe, priors=g2d()).item())
         print(f"[init] nll~{init_nll:.4f}", flush=True)
         log_checkpoint(
             log,
@@ -363,17 +399,20 @@ def train(
 
         for epoch in range(1, epochs + 1):
             g2d.train()
-            planar.train()
+            tn.train()
             losses: list[float] = []
 
             for (det_batch,) in dataloader:
+                # 调整 batch 形状
                 det_batch = det_batch.reshape(nb, mini_batch, -1)
                 optim.zero_grad(set_to_none=True)
                 loss_sum = 0.0
                 for i in range(nb):
                     x = det_batch[i].to(device=device, dtype=dtype)
+                    # 从 g2d 获取底层 gate 映射出的 error model 概率
                     dem_p = g2d()
-                    loss = planar(x, priors=dem_p) / nb
+                    # 传入 TN，此时作为 DEM 先验
+                    loss = tn(x, priors=dem_p) / nb
                     loss.backward()
                     loss_sum += float(loss.detach().cpu().item())
                 optim.step()
@@ -419,7 +458,7 @@ def train(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Gate-level DMLE on repetition code (Stim circuit).")
+    ap = argparse.ArgumentParser(description="Gate-level DMLE on surface code via TN (Stim circuit).")
     ap.add_argument("--distance", type=int, default=3)
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--error-prob", type=float, default=0.001)
@@ -428,44 +467,39 @@ def main() -> None:
         type=str,
         default="si1000",
         choices=("depolarizing", "si1000"),
-        help=(
-            "circuit noise: depolarizing (Stim generated) or si1000 "
-            "(tqec NoiseModel.si1000 on ideal repetition_code:memory)"
-        ),
     )
     ap.add_argument("--num-shots", type=int, default=1_000_000)
     ap.add_argument("--seed", type=int, default=75328)
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--batch-size", type=int, default=10_000)
     ap.add_argument("--mini-batch", type=int, default=1_000)
+    ap.add_argument(
+        "--ctg-max-time",
+        type=int,
+        default=60,
+        help="Max time (seconds) for cotengra to search for contraction path.",
+    )
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument(
         "--no-perturb-init",
         action="store_true",
-        help="skip pl_opt-style random perturbation on gate probabilities at init",
     )
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument(
         "--checkpoint-every",
         type=int,
         default=10,
-        help="log optimized gate/dem error rates every N epochs (0 = final only)",
     )
     ap.add_argument(
         "--log",
         type=str,
         default=None,
-        help=(
-            "log filename under gate/log/rep/sim/ "
-            "(default: rep_d{d}r{r}_p{p}_{param_sharing}.txt)"
-        ),
     )
     ap.add_argument(
         "--param-sharing",
         type=str,
-        default="time_shared",
-        choices=("elementary", "dep", "time_shared"),
-        help="how gate noise scalars are tied across circuit sites (see g2dem.param_sharing)",
+        default="time_shared_dep2",
+        choices=("elementary", "dep", "time_shared","time_shared_dep2"),
     )
     args = ap.parse_args()
 
@@ -488,6 +522,7 @@ def main() -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         mini_batch=args.mini_batch,
+        ctg_max_time=args.ctg_max_time,
         lr=args.lr,
         perturb_init=not args.no_perturb_init,
         device=args.device,

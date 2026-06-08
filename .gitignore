@@ -1,3 +1,6 @@
 __pycache__/
 data/
 log/
+scripts/
+logical/
+gate/figures/
