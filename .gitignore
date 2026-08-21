@@ -1,6 +1,27 @@
+.DS_Store
+.vscode/
+.env
+.venv/
+venv/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+# Local datasets, checkpoints, logs, and generated experiment outputs.
 data/
+dataset/
 log/
-scripts/
-logical/
-gate/figures/
+results/
+tmp/
+*.pt
+*.log
+*.npz
+checkpoints*/
+pretrained/
+bootstrap_results/
+
+# Internal correlation-analysis reference implementation.
+src/ca_ler_compare_ref/

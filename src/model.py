@@ -1,125 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import opt_einsum as oe
-from pymatching import Matching
-from .utils import construct_kac_ward_solution, torch_rep_cir_log_coset_p, rep_cir, get_error_rates, generate_compactified_pcm_from_seperated_dem
-
-
-class PlanarNet(nn.Module):
-    """Planar repetition-code NLL; optional external DEM priors (e.g. from GateNoiseToDEM)."""
-
-    def __init__(
-        self,
-        abstract_code,
-        init_priors,
-        *,
-        dev: str = "cpu",
-        param_mode: str = "logit",
-        log_scale: float = 1.0,
-        learn_priors: bool = True,
-    ) -> None:
-        super().__init__()
-        if abstract_code is None or init_priors is None:
-            raise ValueError("abstract_code and init_priors are required")
-
-        self.dev = dev
-        self.param_mode = param_mode
-        self.log_scale = log_scale
-        self.learn_priors = learn_priors
-        self.dtype = init_priors.dtype
-        self.num_priors = int(init_priors.numel())
-
-        self.generators = np.concatenate([abstract_code.hz, abstract_code.lz.reshape(1, -1)], axis=0)
-        self.kwz, self.edges_dict_z = construct_kac_ward_solution(self.generators)
-        self.pebz = torch.from_numpy(abstract_code.pebz).to(self.dtype).to(self.dev)
-        self.lz = torch.from_numpy(abstract_code.lz).to(self.dtype).to(self.dev)
-
-        init_priors = init_priors.detach().to(self.dtype).to(self.dev)
-        if param_mode == "logit":
-            init_param = torch.log(init_priors / (1.0 - init_priors))
-        elif param_mode == "log_prior":
-            init_priors_clamped = torch.clamp(init_priors, 1e-10, 1.0 - 1e-10)
-            init_param = torch.log(init_priors_clamped) / log_scale
-        else:
-            raise ValueError(f"Unknown param_mode: {param_mode}. Must be 'logit' or 'log_prior'")
-
-        if learn_priors:
-            self.para = nn.Parameter(init_param.clone())
-        else:
-            self.register_buffer("para", init_param.clone())
-
-    def get_priors(self) -> torch.Tensor:
-        """Learnable DEM error probabilities (only when learn_priors=True)."""
-        if not self.learn_priors:
-            raise RuntimeError("learn_priors=False: use forward(..., priors=external_dem)")
-        if self.param_mode == "logit":
-            priors = torch.sigmoid(self.para) + 1e-20
-        elif self.param_mode == "log_prior":
-            priors = torch.exp(self.para * self.log_scale) + 1e-20
-            priors = torch.clamp(priors, 1e-20, 1.0 - 1e-20)
-        else:
-            raise ValueError(f"Unknown param_mode: {self.param_mode}")
-        return priors
-
-    def _resolve_priors(self, priors: torch.Tensor | None) -> torch.Tensor:
-        if priors is None:
-            return self.get_priors()
-        if priors.ndim != 1:
-            raise ValueError(f"priors must be 1-D, got shape {tuple(priors.shape)}")
-        if priors.numel() != self.num_priors:
-            raise ValueError(
-                f"priors length {priors.numel()} != num_priors {self.num_priors} "
-                "(must match rep_cir.reorder'd DEM / g2dem.num_dem)"
-            )
-        return priors.to(device=self.pebz.device, dtype=self.dtype).clamp(1e-20, 1.0 - 1e-20)
-
-    def logp(self, operator: torch.Tensor, error_rates: torch.Tensor) -> torch.Tensor:
-        return torch_rep_cir_log_coset_p(operator, self.kwz, self.edges_dict_z, error_rates=error_rates)
-
-    def forward(self, det: torch.Tensor, priors: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        Negative log-likelihood of detection events.
-
-        When learn_priors=False, pass differentiable DEM from g2dem: planar(det, priors=g2d()).
-        """
-        error_rates = self._resolve_priors(priors)
-        with torch.no_grad():
-            operator = (det * 1.0) @ self.pebz % 2
-        logp = self.logp(operator, error_rates)
-        return -logp.mean()
-
-    def cal_eloss(self, p_exact: torch.Tensor, x_exact: torch.Tensor, priors: torch.Tensor | None = None):
-        error_rates = self._resolve_priors(priors)
-        with torch.no_grad():
-            operator = x_exact @ self.pebz % 2
-        logp = self.logp(operator, error_rates)
-        return -(p_exact * logp).sum()
-
-    def test(self, p_exact, x_exact, nprint=None):
-        if not self.learn_priors:
-            raise RuntimeError("test() requires learn_priors=True")
-        optim = torch.optim.AdamW([self.para], lr=0.01)
-        er_his = []
-        loss_his = []
-        epochs = 500
-        for epoch in range(1, 1 + epochs):
-            loss = self.cal_eloss(p_exact, x_exact)
-            optim.zero_grad()
-            loss.backward()
-            optim.step()
-            if nprint is not None and epoch % nprint == 0:
-                print(
-                    f"epoch:{epoch}, nll:{loss.item()}, grad_mean:{self.para.grad.mean().item()}"
-                )
-                loss_his.append(loss.detach().cpu().item())
-                with torch.no_grad():
-                    er_his.append(self.get_priors().detach().cpu())
-        return er_his
-
+from .utils import get_error_rates
 
 
 def xor_tensor(degree, dtype):
@@ -153,68 +41,36 @@ def prob_tensor(degree, p, connect_to_l=False):
 
 
 class TensorNetwork(nn.Module):
-    def __init__(
-        self, 
-        pcm, 
-        l=None, 
-        priors_logits=None, 
-        dev='cpu', 
-        dtype=torch.float32, 
-        decoding=False,
-        learn_priors=True  # [新增] 决定本层参数是否可学习
-    ):
+    def __init__(self, pcm, l=None, priors_logits=None, dev='cpu', dtype=torch.float32, decoding=False):
         super().__init__()
         self.pcm = pcm
-        self.l = l
+        self.l=l
         self.dev = dev
         self.dtype = dtype
-        self.decoding = decoding
-        self.learn_priors = learn_priors # [新增]
+        self.decoding=decoding
         self.n_check, self.n_bit = pcm.shape
-        
-        # [修改] 仿照 PlanarNet 处理参数：可学习时用 Parameter，否则用 buffer
         if priors_logits is None:
-            init_logits = torch.randn(self.n_bit, dtype=dtype, device=dev)
+            self.priors_logits = nn.Parameter(torch.randn(pcm.shape[1]))
         else:
-            init_logits = priors_logits.detach().to(dev).to(dtype)
-            
-        if self.learn_priors:
-            self.priors_logits = nn.Parameter(init_logits.clone())
-        else:
-            self.register_buffer("priors_logits", init_logits.clone())
-            
-        self.path = None
+            self.priors_logits = nn.Parameter(priors_logits.to(dev).to(dtype))
         self.tree = None
 
         self.generate_xor_tensors()
+
         self.generate_equation()
 
-    # [新增] 仿照 PlanarNet 解析优先概率
-    def _resolve_priors(self, priors: torch.Tensor | None) -> torch.Tensor:
-        """
-        处理内部或外部传入的先验概率。
-        如果是外部传入（如 GateNoiseToDEM 输出），假定其已经是概率空间 [0, 1] 内的值。
-        如果是内部参数，则走 sigmoid 激活。
-        """
-        if priors is not None:
-            # 使用外部传入的底层概率（不需要再过 sigmoid）
-            return priors.to(device=self.dev, dtype=self.dtype).clamp(1e-20, 1.0 - 1e-20)
-        
-        if not self.learn_priors:
-            raise RuntimeError("learn_priors=False: you must provide external priors (probs) during forward()")
-            
-        # 使用内部学习的对数几率转概率
-        return torch.sigmoid(self.priors_logits).clamp(1e-20, 1.0 - 1e-20)
+        pass
 
     def generate_xor_tensors(self):
+
         degree_xor = self.pcm.sum(axis=1)
         self.xor_list = []
-        
+
         H_base = hadamard_tensor(0, self.dtype).to(self.dev)
         self.register_buffer('shared_H', H_base)
-        
+
         for i in range(self.n_check):
-            deg = int(degree_xor[i]) + 1 
+            deg = int(degree_xor[i]) + 1
             correction_factor = torch.tensor(2.0 ** (deg / 2.0 - 1.0), dtype=self.dtype, device=self.dev)
             scaled_H = self.shared_H * correction_factor
             name = f'hadamard_scaled_{i}'
@@ -225,11 +81,11 @@ class TensorNetwork(nn.Module):
 
     def generate_equation(self):
         rows, cols = torch.where(torch.tensor(self.pcm)==1)
-        self.edge_map = {} 
+        self.edge_map = {}
         symbol_counter = 0
         check_conn_symbols = [[] for _ in range(self.n_check)]
         bit_conn_symbols = [[] for _ in range(self.n_bit)]
-        
+
         for r, c in zip(rows.tolist(), cols.tolist()):
             sym = oe.get_symbol(symbol_counter)
             self.edge_map[(r, c)] = sym
@@ -240,10 +96,10 @@ class TensorNetwork(nn.Module):
         syndrome_symbols = []
         for i in range(self.n_check):
             sym = oe.get_symbol(symbol_counter)
-            check_conn_symbols[i].append(sym) 
+            check_conn_symbols[i].append(sym)
             syndrome_symbols.append(sym)
             symbol_counter += 1
-            
+
         lhs_terms = []
         for i in range(self.n_check):
             edges = check_conn_symbols[i]
@@ -254,45 +110,48 @@ class TensorNetwork(nn.Module):
 
         for syms in bit_conn_symbols:
             lhs_terms.append("".join(syms))
-            
+
+
         for sym in syndrome_symbols:
             lhs_terms.append('...'+sym)
-            
+
         lhs = ",".join(lhs_terms)
-        rhs = "..." 
-        
+        rhs = "..."
+
         self.eq_str = f"{lhs}->{rhs}"
-        
+
     def generate_prob_tensors(self, probs):
+        # 保持不变
         tensor_list = []
         degree_prob = self.pcm.sum(axis=0)
         for j in range(self.n_bit):
             degree = int(degree_prob[j])
             p = probs[j]
-            if self.decoding and self.l[j] == 1:
+            if self.decoding and self.l[j] ==1 :
                 pt = prob_tensor(degree, p, connect_to_l=True).to(self.dev).to(self.dtype)
             else:
                 pt = prob_tensor(degree, p).to(self.dev).to(self.dtype)
             tensor_list.append(pt)
         return tensor_list
-    
-    # [修改] 接口参数改为 priors
-    def decoding_forward(self, syndromes, priors=None):
-        path = self.path
+
+    def decoding_forward(self, syndromes, probs=None):
         tree = self.tree
         is_batched = syndromes.ndim == 2
         if not is_batched:
             syndromes = syndromes.unsqueeze(0)
-        syndrome_onehot = torch.nn.functional.one_hot(syndromes.long(), num_classes=2).to(dtype=self.dtype, device=self.dev) 
-        syndrome_vectors = list(syndrome_onehot.unbind(dim=1))  
-        
-        # [修改] 使用 _resolve_priors 统一解析概率
-        probs = self._resolve_priors(priors)
-        
+        syndrome_onehot = torch.nn.functional.one_hot(syndromes.long(), num_classes=2).to(dtype=self.dtype, device=self.dev)
+        syndrome_vectors = list(syndrome_onehot.unbind(dim=1))
+
+
+        if probs is None:
+            probs = torch.sigmoid(self.priors_logits)
+        else:
+            None
+        # print(probs)
         scaled_prob_tensors = []
-        log_scale_factor = 0.0 
+        log_scale_factor = 0.0
         raw_prob_tensors = self.generate_prob_tensors(probs)
-        
+
         for t in raw_prob_tensors:
             max_val = t.abs().max().detach()
             if max_val < 1e-12:
@@ -302,34 +161,32 @@ class TensorNetwork(nn.Module):
             log_scale_factor = log_scale_factor + torch.log(max_val)
 
         operands = self.xor_list + scaled_prob_tensors + syndrome_vectors
-        
-        optimize_arg = path if path is not None else 'auto'
+
         # Contraction
         if tree is not None:
             from .utils import contract
             p0_minus_p1 = contract(tree['tree'], operands)
         else:
-            p0_minus_p1 = oe.contract(self.eq_str, *operands, optimize=optimize_arg)
+            p0_minus_p1 = oe.contract(self.eq_str, *operands, optimize='auto')
         return (1-p0_minus_p1.sign())/2
 
-    # [修改] 接口参数从 priors_logits 改为 priors
-    def forward(self, syndromes, priors=None):
-        path = self.path
+    def forward(self, syndromes, priors_logits=None):
         tree = self.tree
         is_batched = syndromes.ndim == 2
         if not is_batched:
-            syndromes = syndromes.unsqueeze(0)   
+            syndromes = syndromes.unsqueeze(0)
 
         syndrome_onehot = torch.nn.functional.one_hot(syndromes.long(), num_classes=2).to(dtype=self.dtype, device=self.dev)
         syndrome_vectors = list(syndrome_onehot.unbind(dim=1))
-        
-        # [修改] 使用 _resolve_priors 统一解析概率
-        probs = self._resolve_priors(priors)
-        
+        if priors_logits is None:
+            probs = torch.sigmoid(self.priors_logits)
+        else:
+            # self.priors_logits=None
+            probs = torch.sigmoid(priors_logits)
         scaled_prob_tensors = []
-        log_scale_factor = 0.0 
+        log_scale_factor = 0.0
         raw_prob_tensors = self.generate_prob_tensors(probs)
-        
+
         for t in raw_prob_tensors:
             max_val = t.abs().max().detach()
             if max_val < 1e-12:
@@ -339,275 +196,279 @@ class TensorNetwork(nn.Module):
             log_scale_factor = log_scale_factor + torch.log(max_val)
 
         operands = self.xor_list + scaled_prob_tensors + syndrome_vectors
-        optimize_arg = path if path is not None else 'auto'
         # Contraction
         if tree is not None:
             from .utils import contract
             result_normalized = contract(tree['tree'], operands)
         else:
-            result_normalized = oe.contract(self.eq_str, *operands, optimize=optimize_arg)
+            # Use oe.contract with memory_limit to enable slicing
+            result_normalized = oe.contract(self.eq_str, *operands,
+                                           optimize='auto',
+                                           memory_limit=int(4e9))  # 4GB limit
         eps = 1e-30
-        
+
         log_likelihood = torch.log(result_normalized + eps) + log_scale_factor
-            
+
         return - log_likelihood.squeeze(0).mean()
-    
-
-    def find_contraction_path(self, batch_size=50, max_time=600):
-        # 保持不变...
-        import cotengra as ctg
-        shapes = []
-
-        # 1. XOR Tensors
-        for _ in self.xor_list:
-            shapes.append((2, 2))
-
-        # 2. Probability Tensors
-        degree_prob = self.pcm.sum(axis=0)
-        for j in range(self.n_bit):
-            deg = int(degree_prob[j])
-            shapes.append((2,) * deg)
-
-        # 3. Syndrome Vectors
-        for _ in range(self.n_check):
-            shapes.append((batch_size, 2))
-
-        print(f"Searching for contraction path using Cotengra (max_time={max_time}s)...")
-
-        opt = ctg.HyperOptimizer(
-            max_time=max_time, 
-            max_repeats=128,
-            minimize='size',
-            progbar=True,
-            parallel=120,
-        )
-
-        path, path_info = oe.contract_path(self.eq_str, *shapes, optimize=opt, shapes=True)
-        
-        import math
-        flops_log10 = math.log10(path_info.opt_cost)
-        print(f"1. FLOPs (log10):    {flops_log10:.2f}")
-        space_complexity = math.log2(path_info.largest_intermediate)
-        print(f"2. Space Complexity (log2): {space_complexity:.2f}")
-        max_tensor_gb = (path_info.largest_intermediate * 8) / (1024**3)
-        print(f"3. Peak Memory:            {max_tensor_gb:.2f} GB")
-        
-        if space_complexity >= 30:
-            print(f"❌ 警告: 找到的路径 Space Complexity ({space_complexity:.2f}) 达到或超过 30！")
-            print("这会导致极高的显存占用，拒绝采用该路径。")
-            return None
-        
-        return path
-
-    def save_path(self, path, filename="best_contraction_path.pkl"):
-        import pickle  
-        try:
-            with open(filename, 'wb') as f:
-                pickle.dump(path, f)
-            print(f"Path successfully saved to: {filename}")
-        except Exception as e:
-            print(f"Error saving path: {e}")
-
-    def load_path(self, filename="best_contraction_path.pkl"):
-        import pickle
-        import os
-        if not os.path.exists(filename):
-            raise FileNotFoundError(f"Path file '{filename}' not found. Please run find_contraction_path first.")
-        
-        try:
-            with open(filename, 'rb') as f:
-                path = pickle.load(f)
-            print(f"Path successfully loaded from: {filename}")
-            self.path = path
-        except Exception as e:
-            print(f"Error loading path: {e}")
-            self.path = None
-
     def load_tree(self, filename):
         import json
+
         import os
         if not os.path.exists(filename):
             raise FileNotFoundError(f"Tree file '{filename}' not found.")
-        
+
         try:
             with open(filename, 'rb') as f:
                 tree = json.load(f)
             print(f"Tree successfully loaded from: {filename}")
             self.tree = tree
         except Exception as e:
-            print(f"Error loading path: {e}")
+            print(f"Error loading tree: {e}")
             self.tree = None
 
-            
-    
+
 class GroupTN(nn.Module):
-    def __init__(self, d, r, sub_pcms, sub_dets, sub_errors, init_priors, dev='cpu', dtype=torch.float32):
+    def __init__(self, d, r, sub_pcms, sub_dets, sub_errors, init_priors,
+                 dev='cpu', devices=None, dtype=torch.float32, use_tree=True, path_dir=None,
+                 parallel_subs=True, manual_sync_grads=False, sub_full_masks=None,
+                 stop_grad_partial=False, partial_only_grad=True):
         super().__init__()
         self.d, self.r = d, r
         self.sub_pcms = sub_pcms
         self.n_sub = len(sub_pcms)
         self.sub_dets = sub_dets
         self.sub_errors = sub_errors
-        self.dev=dev
-        self.dtype=dtype
+        self.stop_grad_partial = bool(stop_grad_partial)
+        self.partial_only_grad = bool(partial_only_grad)
+        self.sub_full_masks = self._normalize_sub_full_masks(sub_full_masks)
+        self.sub_grad_masks = self._build_sub_grad_masks()
+        if devices is None:
+            devices = [dev]
+        self.devices = [str(device) for device in devices]
+        if len(self.devices) == 0:
+            raise ValueError("GroupTN requires at least one device.")
+        self.primary_dev = self.devices[0]
+        self.dev = self.primary_dev
+        self.dtype = dtype
+        self.use_tree = use_tree
+        self.parallel_subs = parallel_subs and len(self.devices) > 1
+        self.manual_sync_grads = manual_sync_grads and len(self.devices) > 1
 
-        self.priors_logits = nn.Parameter(torch.logit(init_priors))
+        # Default path directory for Julia contraction trees
+        if path_dir is None:
+            self.path_dir = f'path/d{self.d}r{self.r}'
+        else:
+            self.path_dir = path_dir
 
+        self.priors_logits = nn.Parameter(torch.logit(init_priors).to(self.primary_dev).to(self.dtype))
+
+        self.use_tree = use_tree
+        self._cached_priors_by_device = {}
+        self._cached_priors_version = None
         self.construct_tns()
-    
+
+    def _normalize_sub_full_masks(self, sub_full_masks):
+        if sub_full_masks is None:
+            return None
+        if len(sub_full_masks) != self.n_sub:
+            raise ValueError(
+                f"sub_full_masks length {len(sub_full_masks)} does not match "
+                f"number of sub-PCMs {self.n_sub}."
+            )
+
+        masks = []
+        for i, (mask, errors) in enumerate(zip(sub_full_masks, self.sub_errors)):
+            mask = np.asarray(mask, dtype=bool)
+            if mask.shape[0] != len(errors):
+                raise ValueError(
+                    f"sub_full_masks[{i}] length {mask.shape[0]} does not match "
+                    f"sub_errors[{i}] length {len(errors)}."
+                )
+            masks.append(mask)
+        return masks
+
+    def _build_sub_grad_masks(self):
+        if not self.stop_grad_partial or self.sub_full_masks is None:
+            return None
+
+        full_covered_errors = set()
+        all_touched_errors = set()
+        for errors, full_mask in zip(self.sub_errors, self.sub_full_masks):
+            errors = np.asarray(errors, dtype=int)
+            all_touched_errors.update(errors.tolist())
+            full_covered_errors.update(errors[full_mask].tolist())
+
+        grad_masks = []
+        stopped_partial_occurrences = 0
+        partial_only_occurrences = 0
+        for errors, full_mask in zip(self.sub_errors, self.sub_full_masks):
+            errors = np.asarray(errors, dtype=int)
+            grad_mask = np.array(full_mask, dtype=bool, copy=True)
+            if self.partial_only_grad:
+                partial_only = np.array(
+                    [error not in full_covered_errors for error in errors],
+                    dtype=bool,
+                )
+                partial_only_occurrences += int(np.count_nonzero(partial_only & ~full_mask))
+                grad_mask |= partial_only
+            stopped_partial_occurrences += int(np.count_nonzero(~grad_mask))
+            grad_masks.append(torch.as_tensor(grad_mask, dtype=torch.bool))
+
+        self.partial_gradient_stats = {
+            "stop_grad_partial": True,
+            "partial_only_grad": self.partial_only_grad,
+            "touched_errors": len(all_touched_errors),
+            "full_covered_errors": len(full_covered_errors),
+            "partial_only_errors": len(all_touched_errors - full_covered_errors),
+            "stopped_partial_occurrences": stopped_partial_occurrences,
+            "partial_only_occurrences_with_grad": partial_only_occurrences,
+        }
+        return grad_masks
+
+    def _refresh_priors_cache(self):
+        version = self.priors_logits._version
+        if self._cached_priors_version == version and self._cached_priors_by_device:
+            return self._cached_priors_by_device
+
+        priors_by_device = {}
+        unique_devices = sorted(set(self.tn_devices))
+        for dev in unique_devices:
+            if dev == self.primary_dev:
+                priors_by_device[dev] = self.priors_logits
+            else:
+                priors_by_device[dev] = self.priors_logits.to(dev, non_blocking=True)
+        self._cached_priors_by_device = priors_by_device
+        self._cached_priors_version = version
+        return priors_by_device
+
+    def _forward_single_sub(self, i, syndromes_by_device, priors_by_device):
+        tn_dev = self.tn_devices[i]
+        device_syndromes = syndromes_by_device[tn_dev]
+        sub_syndromes = device_syndromes[:, self.sub_dets[i]]
+        sub_priors_logits = priors_by_device[tn_dev][self.sub_errors[i]]
+        if self.sub_grad_masks is not None:
+            grad_mask = self.sub_grad_masks[i].to(tn_dev, non_blocking=True)
+            sub_priors_logits = torch.where(
+                grad_mask,
+                sub_priors_logits,
+                sub_priors_logits.detach(),
+            )
+        return self.tns[i].forward(
+            sub_syndromes,
+            priors_logits=sub_priors_logits
+        )
+
     def construct_tns(self):
         self.tns = nn.ModuleList()
+        self.tn_devices = []
 
         for i in range(self.n_sub):
             pcmi = self.sub_pcms[i]
             for j in range(i):
-                if pcmi.shape == self.sub_pcms[j].shape:
-                    if (pcmi - self.sub_pcms[j]).all()==0:
-                        self.tns.append(self.tns[j])
-                        break
+                if np.array_equal(pcmi, self.sub_pcms[j]):
+                    self.tns.append(self.tns[j])
+                    self.tn_devices.append(self.tn_devices[j])
+                    break
             else:
-                tn = TensorNetwork(pcm=pcmi, dev=self.dev, dtype=self.dtype)
-                tn.load_path(filename=f'path/d{self.d}r{self.r}/subsample_path_{i}.pkl')
+                tn_dev = self.devices[i % len(self.devices)]
+                tn = TensorNetwork(pcm=pcmi, dev=tn_dev, dtype=self.dtype)
+                if not self.use_tree:
+                    raise ValueError("GroupTN requires Julia JSON contraction trees; use_tree=False is unsupported.")
+                tree_file = f'{self.path_dir}/subsample_tree_{i}.json'
+                tn.load_tree(tree_file)
                 self.tns.append(tn)
-                
-    def forward(self, syndromes):
-        
-        # loss  = 
-                # + self.tns[1].forward(syndromes[:, self.sub_dets[1]])
-        loss = torch.cat([self.tns[i].forward(
-            syndromes[:, self.sub_dets[i]], 
-            priors_logits=self.priors_logits[self.sub_errors[i]]
-            ).unsqueeze(0)
+                self.tn_devices.append(tn_dev)
+
+    def _prepare_syndromes_by_device(self, syndromes):
+        unique_devices = sorted(set(self.tn_devices))
+        syndromes_by_device = {}
+        for dev in unique_devices:
+            if str(syndromes.device) == dev:
+                syndromes_by_device[dev] = syndromes
+            else:
+                syndromes_by_device[dev] = syndromes.to(dev, non_blocking=True)
+        return syndromes_by_device
+
+    def _parallel_map_sub_losses(self, syndromes_by_device, priors_by_device):
+        if self.parallel_subs:
+            with ThreadPoolExecutor(max_workers=self.n_sub) as executor:
+                futures = [
+                    executor.submit(self._forward_single_sub, i, syndromes_by_device, priors_by_device)
+                    for i in range(self.n_sub)
+                ]
+                return [future.result() for future in futures]
+        return [
+            self._forward_single_sub(i, syndromes_by_device, priors_by_device)
             for i in range(self.n_sub)
-            ]).mean()
-        
+        ]
+
+    def forward(self, syndromes):
+        syndromes_by_device = self._prepare_syndromes_by_device(syndromes)
+        priors_by_device = self._refresh_priors_cache()
+        raw_losses = self._parallel_map_sub_losses(syndromes_by_device, priors_by_device)
+
+        loss_terms = []
+        for loss_i in raw_losses:
+            if str(loss_i.device) != self.primary_dev:
+                loss_i = loss_i.to(self.primary_dev)
+            loss_terms.append(loss_i)
+        loss = torch.stack(loss_terms).mean()
+
         return loss
 
+    def manual_sync_loss_and_grad(self, syndromes, loss_scale=1.0):
+        if not self.manual_sync_grads:
+            loss = self.forward(syndromes) * loss_scale
+            loss.backward()
+            return loss.detach()
 
+        syndromes_by_device = self._prepare_syndromes_by_device(syndromes)
+        unique_devices = sorted(set(self.tn_devices))
+        priors_by_device = {}
+        for dev in unique_devices:
+            priors_by_device[dev] = (
+                self.priors_logits.detach().to(dev, non_blocking=True).requires_grad_(True)
+            )
 
+        raw_losses = self._parallel_map_sub_losses(syndromes_by_device, priors_by_device)
+        per_device_losses = {dev: [] for dev in unique_devices}
+        total_loss_value = 0.0
+        for i, loss_i in enumerate(raw_losses):
+            per_device_losses[self.tn_devices[i]].append(loss_i / self.n_sub)
+            total_loss_value += loss_i.detach().to(self.primary_dev).item() / self.n_sub
 
+        total_grad = torch.zeros_like(self.priors_logits, device=self.primary_dev)
+        for dev, loss_terms in per_device_losses.items():
+            if not loss_terms:
+                continue
+            local_loss = torch.stack(loss_terms).sum() * loss_scale
+            local_loss.backward()
+            local_grad = priors_by_device[dev].grad
+            if local_grad is not None:
+                total_grad.add_(local_grad.to(self.primary_dev, non_blocking=True))
 
-class MatchingNet(nn.Module):
-    def __init__(self, dem, init_priors=None, dev='cpu', dtype=torch.float32):
-        super().__init__()
-        '''The 'decompose_errors' must be True'''
-        self.dtype=dtype
-        self.dev=dev
-        self.pcm, self.edges_mapping = generate_compactified_pcm_from_seperated_dem(dem)
-
-        if init_priors == None:
-            init_priors = torch.from_numpy(get_error_rates(dem)).to(dev).to(dtype)
-            self.negative_priors_logits = nn.Parameter(-torch.logit(init_priors).to(dev).to(dtype))
+        if self.priors_logits.grad is None:
+            self.priors_logits.grad = total_grad
         else:
-            self.negative_priors_logits = nn.Parameter(-torch.logit(init_priors).to(dev).to(dtype))
-    
-    def forward(self, syndromes):
-        probs = torch.sigmoid(-self.negative_priors_logits)
+            self.priors_logits.grad.copy_(total_grad)
 
-        probs_list = []
-        for edge_info in self.edges_mapping:
-            # idx = edge_info['new_edge_id']
-            source = edge_info['source_hyperedge_indices']
-            if len(source) > 1:
-                prob_edge = 0.5 * (1 - torch.prod(1 - 2 * probs[source]))
-            else:
-                prob_edge = probs[source]
-            probs_list.append(prob_edge.squeeze())
-        # print(probs_list)
-        probs_compactified = torch.stack(probs_list)
-        
-        # log_one_minus_p = torch.log(1.-probs_compactified).sum(0)
-        
-        decoder = Matching(self.pcm, 
-                           error_probabilities=probs_compactified.detach().cpu().numpy())
+        return torch.tensor(total_loss_value * loss_scale, device=self.primary_dev, dtype=self.dtype)
 
-        if isinstance(syndromes, torch.Tensor):
-            syndromes_np = syndromes.detach().cpu().numpy().astype(np.uint8)
-        else:
-            syndromes_np = syndromes
-        
-        error_configs = decoder.decode_batch(syndromes_np)
-        error_configs = torch.from_numpy(error_configs).to(self.dtype).to(self.dev)
-        log_operators_probs = torch.log(probs_compactified*error_configs + (1-probs_compactified)*(1-error_configs)).sum(1)
-        # print(error_configs.shape)
-        # print(log_operators_probs.shape)
-        return -log_operators_probs.mean(0)
+    def sequential_sub_loss_and_grad(self, syndromes, loss_scale=1.0):
+        """Backward each sub-TN loss immediately while preserving the mean-loss objective.
 
+        This is useful on a single large GPU: it avoids keeping all sub-TN
+        autograd graphs alive at the same time. The optimizer step should still
+        be called once after all sub losses have accumulated.
+        """
+        syndromes_by_device = self._prepare_syndromes_by_device(syndromes)
+        priors_by_device = self._refresh_priors_cache()
+        total_loss_value = 0.0
 
-if __name__ == '__main__':
-    import stim
-    import warnings
-    warnings.filterwarnings("ignore", message="Casting complex values to real")
-    
-    d = 3 # distance
-    r = 5 # rounds
-    error_prob = 0.001 # probability of errors generation
+        for i in range(self.n_sub):
+            loss_i = self._forward_single_sub(i, syndromes_by_device, priors_by_device)
+            scaled_loss = loss_i * (loss_scale / self.n_sub)
+            scaled_loss.backward()
+            total_loss_value += scaled_loss.detach().to(self.primary_dev).item()
 
-    dev = 'cpu'
-    dtype=torch.float64
-    task_check = 'exact_probability' # ['exact_probability', 'gradient_check', 'logical_error_rate']
-
-    #circuit
-    circuit = stim.Circuit.generated(code_task="repetition_code:memory",
-                                            distance=d,
-                                            rounds=r,
-                                            after_clifford_depolarization=error_prob,
-                                            before_measure_flip_probability=error_prob,
-                                            after_reset_flip_probability=error_prob,
-                                            )
-
-    # detector error model
-    dem = circuit.detector_error_model(decompose_errors=False, flatten_loops=True)
-    # define the DEM-code
-    rep = rep_cir(d, r)
-    rep.reorder(dem)
-
-    er = get_error_rates(dem)
-    er = torch.tensor(er).to(dev).to(dtype)
-    pertub = torch.rand_like(er)
-    init_er = (er + (2*torch.bernoulli(torch.ones(len(er)).to(dtype)/2)-1.)*er*pertub) 
-
-    pln = PlanarNet(rep, init_er, dev=dev)
-
-    
-
-
-    x_exact = np.array(
-    [list(map(int, bin(x)[2:].zfill(rep.hx.shape[0]))) for x in range(2**(rep.hx.shape[0]))]
-    ).astype(bool)
-    x_exact = torch.from_numpy(x_exact*1.0).to(dtype=dtype)
-
-    with torch.no_grad():
-        operators = x_exact @ pln.pebz % 2
-
-        # operators_l = ((x_exact @ pln.pebz)+rep.lz) % 2
-        # '''log probabilities and probabilities of each configuration'''
-        # logp_0, logp_1 = pln.logp0(operators, er), pln.logp0(operators_l, er)
-        # p_0, p_1 = torch.exp(logp_0), torch.exp(logp_1)
-        # '''p(s) = p(s, l=0) + p(s, l=1)'''
-        # with torch.no_grad():
-        #     p = p_0.detach() + p_1.detach()
-        # print('normalization: {:5f}'.format(p.sum().item()))
-        # logp = torch.log(p_0+p_1)
-        # '''nll = - sum p*log(p)'''
-        # nll_exact = - (p*logp).sum()
-        # print('exact NLL:', nll_exact.item())
-
-        logpl = pln.logp(operators, er)
-        p_exact = torch.exp(pln.logp(operators, er))
-        nll1 = -(p_exact*logpl).sum()
-        print('exact Nll (L):', nll1.item())
-
-       
-        
-
-    pln.test(p_exact, x_exact, 100)
-
-    er_opt = torch.sigmoid(pln.para.detach().cpu())
-
-
-    print('Mean of Relative Errors :', (abs(er_opt-er)/er).mean())
-
-
-    
-
+        return torch.tensor(total_loss_value, device=self.primary_dev, dtype=self.dtype)

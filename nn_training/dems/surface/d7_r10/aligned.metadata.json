@@ -1,0 +1,13 @@
+{
+  "checkpoint": "epoch 250 checkpoint (not included)",
+  "round_root": "dataset/google_broadcast_source/d7_at_q6_7_bulk2/X/r04",
+  "output": "nn_training/dems/surface/d7_r10/aligned.dem",
+  "source_max_time": 4,
+  "broadcast_time_layer": 10,
+  "repeat_chunk": 1,
+  "num_detectors": 480,
+  "num_errors": 8137,
+  "num_observables": 1,
+  "checkpoint_epoch": 250,
+  "checkpoint_ler": null
+}
