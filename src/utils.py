@@ -1189,6 +1189,44 @@ def broadcast_dem(origin_dem, broadcast_time_layer, repeat_chunk, objective_dem_
             
     return output_dem
 
+def order_to_tree(inputs: list[list[int]], output: list[int], order) -> dict:
+    """Convert a pairwise contraction order into the nested tree used by ``contract``.
+
+    ``inputs[k]`` are the index labels of the k-th tensor and ``output`` the labels kept in
+    the result. Each step ``(i, j)`` of ``order`` contracts the tensors currently stored at
+    positions ``i`` and ``j`` and stores the result at ``i`` (the convention of artensor).
+    The returned dict has the layout of the OMEinsumContractionOrders json files in ``path/``.
+    """
+    if len(order) != len(inputs) - 1:
+        raise ValueError(f"an order over {len(inputs)} tensors needs {len(inputs) - 1} steps, got {len(order)}")
+
+    # Number of live tensors carrying each label: a label is summed over as soon as the
+    # tensor being formed is the only one left with it (this also covers hyperedges).
+    count = defaultdict(int)
+    for labels in inputs:
+        for label in labels:
+            count[label] += 1
+    keep = set(output)
+
+    nodes = {k: ({"isleaf": True, "tensorindex": k + 1}, list(labels)) for k, labels in enumerate(inputs)}
+    for i, j in order:
+        if i == j or i not in nodes or j not in nodes:
+            raise ValueError(f"invalid contraction step {(i, j)}")
+        left, ix = nodes[i]
+        right, jx = nodes.pop(j)
+        for label in set(ix) & set(jx):
+            count[label] -= 1
+        iy = [label for label in dict.fromkeys(ix + jx) if label in keep or count[label] > 1]
+        nodes[i] = ({"isleaf": False, "eins": {"ixs": [ix, jx], "iy": iy}, "args": [left, right]}, iy)
+
+    (root, iy), = nodes.values()
+    if set(iy) != keep:
+        raise ValueError(f"the contraction ends with labels {iy}, expected {list(output)}")
+    root["eins"]["iy"] = list(output)
+    return {"inputs": [list(labels) for labels in inputs], "output": list(output), "slices": [],
+            "label-type": "Int64", "tree": root}
+
+
 def contract(tree, tensors: list[torch.Tensor]) -> torch.Tensor:
     """Contract tensors according to the optimized tree."""
     return _contract_recursive(tree, tensors)

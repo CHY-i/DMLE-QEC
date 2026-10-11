@@ -399,6 +399,91 @@ class TensorNetwork(nn.Module):
         
         return path
 
+    def einsum_structure(self, batch_size=50):
+        """Integer-labelled form of ``eq_str`` for order finders that do not read einsum strings.
+
+        Returns the labels of every operand (in the operand order of ``forward``), the size of
+        every label and the output labels. Label 1 is the batch index of the syndrome vectors,
+        as in the json trees under ``path/``.
+        """
+        batch_label = 1
+        labels = {}
+        inputs = []
+        for term in self.eq_str.split('->')[0].split(','):
+            batched = term.startswith('...')
+            symbols = term[3:] if batched else term
+            ix = [batch_label] if batched else []
+            for sym in symbols:
+                ix.append(labels.setdefault(sym, len(labels) + 2))
+            inputs.append(ix)
+
+        bond_dims = {label: 2 for label in labels.values()}
+        bond_dims[batch_label] = batch_size
+        return inputs, bond_dims, [batch_label]
+
+    def find_contraction_tree(self, batch_size=50, sc_target=30, trials=8, iters=50, betas=None,
+                              alpha=4.0, seed=0):
+        """Search a contraction tree with artensor (greedy start + simulated annealing on the tree).
+
+        ``trials`` annealing runs are started from different greedy orders; each one does ``iters``
+        sweeps at every inverse temperature in ``betas``. The annealing minimizes FLOPs plus
+        ``alpha`` times the memory traffic (sizes of the tensors read and written), with a penalty
+        on the space complexity (log2 of the largest tensor, batch included) above ``sc_target``.
+        ``alpha=0`` gives fewer FLOPs but intermediate tensors that take several times more memory.
+        Returns a tree for ``save_tree`` / ``load_tree``, or None if the best tree found is still
+        above ``sc_target``.
+        """
+        import artensor
+        from artensor.order_finder import simulate_annealing
+        from .utils import order_to_tree
+
+        inputs, bond_dims, output = self.einsum_structure(batch_size)
+        if betas is None:
+            betas = np.linspace(3.0, 21.0, 61)
+
+        # Every Hadamard matrix is first absorbed into the prob tensor or syndrome vector on its
+        # edge, which only renames that edge to the hyperedge of the check. artensor then orders
+        # the remaining prob tensors and syndrome vectors, a several times smaller network.
+        n_xor = len(self.xor_list)
+        owner = {label: k for k in range(n_xor, len(inputs)) for label in inputs[k]}
+        reduced = [list(ix) for ix in inputs[n_xor:]]
+        absorb = []
+        for k, (edge, hyper) in enumerate(inputs[:n_xor]):
+            ix = reduced[owner[edge] - n_xor]
+            ix[ix.index(edge)] = hyper
+            absorb.append((owner[edge], k))
+        reduced_dims = {label: bond_dims[label] for ix in reduced for label in ix}
+
+        print(f"Searching for contraction tree using artensor (trials={trials}, iters={iters})...")
+
+        def report(trial, tc, sc, mc):
+            print(f"  trial {trial + 1}/{trials}: FLOPs (log10) {tc:.2f}, Space Complexity (log2) {sc:.2f}")
+
+        # By default artensor slices bonds whenever a trial ends above sc_target. Here the batch
+        # index plays that role (use a smaller batch_size) and ``contract`` has no slicing, so
+        # sc_target only enters as the penalty of the annealing.
+        network = artensor.AbstractTensorNetwork(reduced, reduced_dims, output_bonds=output)
+        best_order, _ = simulate_annealing(
+            network, sc_target=sc_target, trials=trials, iters=iters, betas=betas, start_seed=seed,
+            alpha=alpha, workers=1, slicing=False, trial_callback=report,
+        )
+
+        order = absorb + [(i + n_xor, j + n_xor) for i, j in best_order]
+        network = artensor.AbstractTensorNetwork(inputs, bond_dims, output_bonds=output)
+        tc, sc, _ = artensor.ContractionTree(network, order).tree_complexity()
+
+        print(f"1. FLOPs (log10):    {tc:.2f}")
+        print(f"2. Space Complexity (log2): {sc:.2f}")
+        max_tensor_gb = (2.0 ** sc * torch.finfo(self.dtype).bits / 8) / (1024**3)
+        print(f"3. Peak Memory:            {max_tensor_gb:.2f} GB")
+
+        if sc > sc_target:
+            print(f"Warning: the space complexity of the best tree found ({sc:.2f}) is above {sc_target}; tree rejected.")
+            print("Use a smaller batch_size or a longer search (trials / iters).")
+            return None
+
+        return order_to_tree(inputs, output, order)
+
     def save_path(self, path, filename="best_contraction_path.pkl"):
         import pickle  
         try:
@@ -422,6 +507,14 @@ class TensorNetwork(nn.Module):
         except Exception as e:
             print(f"Error loading path: {e}")
             self.path = None
+
+    def save_tree(self, tree, filename="best_contraction_tree.json"):
+        import json
+        import os
+        os.makedirs(os.path.dirname(filename) or '.', exist_ok=True)
+        with open(filename, 'w') as f:
+            json.dump(tree, f)
+        print(f"Tree successfully saved to: {filename}")
 
     def load_tree(self, filename):
         import json

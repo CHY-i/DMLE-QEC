@@ -1,3 +1,4 @@
+artensor @ git+https://github.com/Fanerst/artensor.git@566b48774bf00438d94b1cd0bd8bfa9481a75974
 beliefmatching==0.2.0
 cotengra==0.7.5
 fire==0.7.1

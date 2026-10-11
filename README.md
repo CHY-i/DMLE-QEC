@@ -200,3 +200,35 @@ optimized_error_rates = tn_optimizing(
     epochs=100
 )
 ```
+
+## 3. Contraction order with artensor
+
+The contraction order can also be searched with [artensor](https://github.com/Fanerst/artensor) (greedy start followed by simulated annealing on the contraction tree). artensor is not on PyPI:
+
+```
+pip install git+https://github.com/Fanerst/artensor.git
+```
+
+Replace the contraction path block in `tn_optimizing` by
+
+```python
+    tn_contract_tree_file = f'path/simulation/d{d}r{r}.json'
+
+    # If contraction tree not exists
+    import os
+    if not os.path.exists(tn_contract_tree_file):
+        tree = tn.find_contraction_tree(batch_size=batch_size, trials=8, iters=50)
+        tn.save_tree(tree, filename=tn_contract_tree_file)
+
+    tn.load_tree(tn_contract_tree_file)
+```
+
+`batch_size` is the number of syndromes per `forward` call; it only enters the cost of the tree, which stays valid for any batch size. The annealing penalizes trees whose largest tensor exceeds `2**sc_target` elements (default `sc_target=30`, batch included), and `find_contraction_tree` returns `None` if the best tree found is still above it; use a smaller batch or a longer search (`trials`, `iters`) in that case. The tree is saved in the same json format as the trees in `path/sycamore`.
+
+The default `iters=50` is enough for distance 3 (a few seconds). Distance 5 needs a longer search: on the network of `path/sycamore/d5_r05.json`, `tn.find_contraction_tree(batch_size=50, iters=600)` takes about 9 minutes on a laptop and reaches the space complexity of the tree stored there.
+
+A test on the distance-3 rotated surface code (exact syndrome probabilities, agreement with the default opt_einsum contraction, and a short optimization):
+
+```
+python script/test_tn_order_artensor.py
+```
