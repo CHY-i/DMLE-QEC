@@ -128,12 +128,29 @@ def build_repetition_circuit(
     raise ValueError(f"unknown noise_model={noise_model!r}")
 
 
-def _dem_probs_from_stim(circuit: stim.Circuit) -> np.ndarray:
+def _dem_probs_from_stim(
+    circuit: stim.Circuit,
+    *,
+    reference_dem: stim.DetectorErrorModel | None = None,
+) -> np.ndarray:
     dem = circuit.detector_error_model(decompose_errors=False, flatten_loops=True)
-    return np.array(
-        [float(dem[i].args_copy()[0]) for i in range(dem.num_errors) if dem[i].type == "error"],
-        dtype=np.float64,
-    )
+    if reference_dem is None:
+        return np.array(
+            [float(op.args_copy()[0]) for op in dem if op.type == "error"], dtype=np.float64
+        )
+    from src.stim_error_analyzer import syndrome_from_dem_error
+
+    by_syndrome = {
+        syndrome_from_dem_error(dem, i): float(dem[i].args_copy()[0])
+        for i in range(len(dem)) if dem[i].type == "error"
+    }
+    keys = [
+        syndrome_from_dem_error(reference_dem, i)
+        for i in range(len(reference_dem)) if reference_dem[i].type == "error"
+    ]
+    if by_syndrome.keys() - set(keys):
+        raise ValueError("Stim produced mechanisms outside the compiled fault support")
+    return np.array([by_syndrome.get(key, 0.0) for key in keys], dtype=np.float64)
 
 
 def _depolarize2_pairs(targets: list[int]) -> list[tuple[int, int]]:
@@ -1009,6 +1026,18 @@ def compile_circuit(
     *,
     param_sharing: ParamSharing = "time_shared_dep12",
 ) -> dict:
+    """Compile fixed fault support and sharing metadata.
+
+    ``stim_dem`` includes explicit zero-rate columns for allowed mechanisms
+    absent from the initial Stim DEM. Construct downstream parity matrices from
+    this returned model; ``num_dem``, ``ref_dem_probs`` and ``stim_dem_probs``
+    all use its error order. Existing nonzero columns retain their order.
+    Noise instructions must exist in the input circuit to be controllable;
+    ``M(0)`` is an explicit learnable site, while unparameterized ``M`` is not.
+    Sharing still determines allowed updates: e.g. ``dep`` preserves reference
+    rate ratios, so its zero multipliers remain zero. Use ``elementary`` or
+    explicit external elementary probabilities to activate such sites.
+    """
     from src.stim_error_analyzer import compile_stim_analyzer
 
     param_key_to_id, elem_keys, init_elem_probs = _scan_elementary_gate_params(circuit)
@@ -1018,26 +1047,21 @@ def compile_circuit(
     init_gate_probs = _expand_gate_probs(
         init_learn_probs, elem_to_learn, gate_prob_multipliers, init_elem_probs
     )
-    ref_dem_probs = _probe_dem(
-        circuit,
-        init_learn_probs,
-        param_key_to_id=param_key_to_id,
-        elem_to_learn=elem_to_learn,
-        gate_prob_multipliers=gate_prob_multipliers,
-        init_elem_probs=init_elem_probs,
-    )
     flat, merge_ops, stim_dem = compile_stim_analyzer(
         circuit,
         param_key_to_id=param_key_to_id,
         elem_to_learn=elem_to_learn,
         elem_keys=elem_keys,
         init_gate_probs=init_gate_probs,
-        ref_dem_probs=ref_dem_probs,
         init_learn_probs=init_learn_probs,
         gate_prob_multipliers=gate_prob_multipliers,
         init_elem_probs=init_elem_probs,
     )
-    stim_dem_probs = _dem_probs_from_stim(circuit)
+    reference_circuit = _circuit_with_gate_probs(
+        circuit, init_gate_probs, param_key_to_id=param_key_to_id
+    )
+    ref_dem_probs = _dem_probs_from_stim(reference_circuit, reference_dem=stim_dem)
+    stim_dem_probs = _dem_probs_from_stim(circuit, reference_dem=stim_dem)
     return {
         "num_dem": len(ref_dem_probs),
         "num_slots": len(learn_keys),
@@ -1103,11 +1127,11 @@ class GateNoiseToDEM(nn.Module):
             torch.tensor(meta["stim_dem_probs"], dtype=dtype, device=device),
         )
 
-        init_p = np.clip(meta["init_learn_probs"], 1e-12, 1.0 - 1e-12)
         if param_mode == "logit":
+            init_p = np.clip(meta["init_learn_probs"], 1e-12, 1.0 - 1e-12)
             init_param = np.log(init_p / (1.0 - init_p))
         elif param_mode == "raw":
-            init_param = init_p.copy()
+            init_param = meta["init_learn_probs"].copy()
         else:
             raise ValueError("param_mode must be 'logit' or 'raw'")
 
@@ -1128,7 +1152,7 @@ class GateNoiseToDEM(nn.Module):
         if self.param_mode == "logit":
             learn = torch.sigmoid(p)
         else:
-            learn = p.clamp(1e-12, 1.0 - 1e-12)
+            learn = p.clamp(0.0, 1.0)
         out = self.init_elementary_probs.clone()
         for eid, lid in enumerate(self._elem_to_learn):
             if lid >= 0:
@@ -1306,17 +1330,33 @@ def _validate_circuit(
         f"  [{param_sharing}] learnable={module.num_slots} elementary={module.num_elementary} "
         f"dem={module.num_dem}"
     )
+    meta = compile_circuit(circuit, param_sharing=param_sharing)
+    init = meta["init_learn_probs"]
+    # Matching Stim at the compiled rates alone says nothing about the Jacobian: also compare
+    # with every learnable rate rescaled on its own.
+    rescaled = init * np.random.default_rng(0).uniform(0.5, 2.0, size=init.shape)
     with torch.no_grad():
-        pred = module()
-        ref = module.ref_dem_probs
-        max_abs = float((pred - ref).abs().max())
-        if max_abs > max_abs_tol:
-            worst = int(torch.argmax((pred - ref).abs()).item())
-            raise AssertionError(
-                f"{label} {param_sharing}: max_abs={max_abs}, line {worst}: "
-                f"pred={float(pred[worst]):.6g} stim={float(ref[worst]):.6g}"
+        for tag, learn_probs in (("init", init), ("rescaled", rescaled)):
+            pred = module(torch.logit(torch.tensor(learn_probs, dtype=torch.float64)))
+            patched = _circuit_with_learn_probs(
+                circuit,
+                learn_probs,
+                param_key_to_id=meta["param_key_to_id"],
+                elem_to_learn=meta["elem_to_learn"],
+                gate_prob_multipliers=meta["gate_prob_multipliers"],
+                init_elem_probs=meta["init_elem_probs"],
             )
-        print(f"    max|g2d-stim|={max_abs:.3e}")
+            ref = torch.tensor(
+                _dem_probs_from_stim(patched, reference_dem=meta["stim_dem"]), dtype=torch.float64
+            )
+            max_abs = float((pred - ref).abs().max())
+            if max_abs > max_abs_tol:
+                worst = int(torch.argmax((pred - ref).abs()).item())
+                raise AssertionError(
+                    f"{label} {param_sharing} ({tag} rates): max_abs={max_abs}, line {worst}: "
+                    f"pred={float(pred[worst]):.6g} stim={float(ref[worst]):.6g}"
+                )
+            print(f"    max|g2d-stim|={max_abs:.3e} ({tag} rates)")
     module.zero_grad()
     module().sum().backward()
     assert module.gate_param.grad is not None and torch.isfinite(module.gate_param.grad).all()
